@@ -1,13 +1,13 @@
 use crate::{segment::PrunePurpose, PruneSegment, PruneSegmentError};
 use alloy_primitives::BlockNumber;
-use reth_codecs::{add_arbitrary_tests, Compact};
-use serde::{Deserialize, Serialize};
 
 /// Prune mode.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Compact)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(any(test, feature = "test-utils"), derive(arbitrary::Arbitrary))]
-#[add_arbitrary_tests(compact)]
+#[cfg_attr(any(test, feature = "reth-codec"), derive(reth_codecs::Compact))]
+#[cfg_attr(any(test, feature = "reth-codec"), reth_codecs::add_arbitrary_tests(compact))]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(test, feature = "serde"), serde(rename_all = "lowercase"))]
 pub enum PruneMode {
     /// Prune all blocks.
     Full,
@@ -18,6 +18,7 @@ pub enum PruneMode {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::derivable_impls)]
 impl Default for PruneMode {
     fn default() -> Self {
         Self::Full
@@ -40,16 +41,20 @@ impl PruneMode {
         segment: PruneSegment,
         purpose: PrunePurpose,
     ) -> Result<Option<(BlockNumber, Self)>, PruneSegmentError> {
+        let min_blocks = segment.min_blocks();
         let result = match self {
-            Self::Full if segment.min_blocks(purpose) == 0 => Some((tip, *self)),
+            Self::Full if min_blocks == 0 => Some((tip, *self)),
+            // For segments with min_blocks > 0, Full mode behaves like Distance(min_blocks)
+            Self::Full if min_blocks <= tip => Some((tip - min_blocks, *self)),
+            Self::Full => None, // Nothing to prune yet
             Self::Distance(distance) if *distance > tip => None, // Nothing to prune yet
-            Self::Distance(distance) if *distance >= segment.min_blocks(purpose) => {
+            Self::Distance(distance) if *distance >= segment.min_blocks() => {
                 Some((tip - distance, *self))
             }
             Self::Before(n) if *n == tip + 1 && purpose.is_static_file() => Some((tip, *self)),
             Self::Before(n) if *n > tip => None, // Nothing to prune yet
-            Self::Before(n) if tip - n >= segment.min_blocks(purpose) => {
-                Some(((*n).saturating_sub(1), *self))
+            Self::Before(n) => {
+                (tip - n >= segment.min_blocks()).then(|| ((*n).saturating_sub(1), *self))
             }
             _ => return Err(PruneSegmentError::Configuration(segment)),
         };
@@ -74,41 +79,77 @@ impl PruneMode {
     pub const fn is_full(&self) -> bool {
         matches!(self, Self::Full)
     }
+
+    /// Returns true if the prune mode is [`PruneMode::Distance`].
+    pub const fn is_distance(&self) -> bool {
+        matches!(self, Self::Distance(_))
+    }
+
+    /// Returns the next block number that will EVENTUALLY be pruned after the given checkpoint. It
+    /// should not be used to find if there are blocks to be pruned right now. For that, use
+    /// [`Self::prune_target_block`].
+    ///
+    /// This is independent of the current tip and indicates what block is next in the pruning
+    /// sequence according to this mode's configuration. Returns `None` if no more blocks will
+    /// be pruned (i.e., the mode has reached its target).
+    ///
+    /// # Examples
+    ///
+    /// - `Before(10)` with checkpoint at block 5 returns `Some(6)`
+    /// - `Before(10)` with checkpoint at block 9 returns `None` (done)
+    /// - `Distance(100)` with checkpoint at block 1000 returns `Some(1001)` (always has more)
+    /// - `Full` always returns the next block after checkpoint
+    pub const fn next_pruned_block(&self, checkpoint: Option<BlockNumber>) -> Option<BlockNumber> {
+        let next = match checkpoint {
+            Some(c) => c + 1,
+            None => 0,
+        };
+
+        match self {
+            Self::Before(n) => {
+                if next < *n {
+                    Some(next)
+                } else {
+                    None
+                }
+            }
+            Self::Distance(_) | Self::Full => Some(next),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        PruneMode, PrunePurpose, PruneSegment, PruneSegmentError, MINIMUM_PRUNING_DISTANCE,
-    };
+    use crate::{PruneMode, PrunePurpose, PruneSegment, MINIMUM_UNWIND_SAFE_DISTANCE};
     use assert_matches::assert_matches;
     use serde::Deserialize;
 
     #[test]
     fn test_prune_target_block() {
         let tip = 20000;
-        let segment = PruneSegment::Receipts;
+        let segment = PruneSegment::AccountHistory;
 
         let tests = vec![
-            // MINIMUM_PRUNING_DISTANCE makes this impossible
-            (PruneMode::Full, Err(PruneSegmentError::Configuration(segment))),
+            // Full mode with min_blocks > 0 behaves like Distance(min_blocks)
+            (PruneMode::Full, Ok(Some(tip - segment.min_blocks()))),
             // Nothing to prune
             (PruneMode::Distance(tip + 1), Ok(None)),
             (
-                PruneMode::Distance(segment.min_blocks(PrunePurpose::User) + 1),
-                Ok(Some(tip - (segment.min_blocks(PrunePurpose::User) + 1))),
+                PruneMode::Distance(segment.min_blocks() + 1),
+                Ok(Some(tip - (segment.min_blocks() + 1))),
             ),
             // Nothing to prune
             (PruneMode::Before(tip + 1), Ok(None)),
             (
-                PruneMode::Before(tip - MINIMUM_PRUNING_DISTANCE),
-                Ok(Some(tip - MINIMUM_PRUNING_DISTANCE - 1)),
+                PruneMode::Before(tip - MINIMUM_UNWIND_SAFE_DISTANCE),
+                Ok(Some(tip - MINIMUM_UNWIND_SAFE_DISTANCE - 1)),
             ),
             (
-                PruneMode::Before(tip - MINIMUM_PRUNING_DISTANCE - 1),
-                Ok(Some(tip - MINIMUM_PRUNING_DISTANCE - 2)),
+                PruneMode::Before(tip - MINIMUM_UNWIND_SAFE_DISTANCE - 1),
+                Ok(Some(tip - MINIMUM_UNWIND_SAFE_DISTANCE - 2)),
             ),
-            (PruneMode::Before(tip - 1), Err(PruneSegmentError::Configuration(segment))),
+            // Nothing to prune
+            (PruneMode::Before(tip - 1), Ok(None)),
         ];
 
         for (index, (mode, expected_result)) in tests.into_iter().enumerate() {
@@ -122,7 +163,11 @@ mod tests {
 
         // Test for a scenario where there are no minimum blocks and Full can be used
         assert_eq!(
-            PruneMode::Full.prune_target_block(tip, PruneSegment::Transactions, PrunePurpose::User),
+            PruneMode::Full.prune_target_block(
+                tip,
+                PruneSegment::TransactionLookup,
+                PrunePurpose::User
+            ),
             Ok(Some((tip, PruneMode::Full))),
         );
     }
@@ -135,13 +180,13 @@ mod tests {
         let tests = vec![
             (PruneMode::Distance(tip + 1), 1, !should_prune),
             (
-                PruneMode::Distance(MINIMUM_PRUNING_DISTANCE + 1),
-                tip - MINIMUM_PRUNING_DISTANCE - 1,
+                PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE + 1),
+                tip - MINIMUM_UNWIND_SAFE_DISTANCE - 1,
                 !should_prune,
             ),
             (
-                PruneMode::Distance(MINIMUM_PRUNING_DISTANCE + 1),
-                tip - MINIMUM_PRUNING_DISTANCE - 2,
+                PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE + 1),
+                tip - MINIMUM_UNWIND_SAFE_DISTANCE - 2,
                 should_prune,
             ),
             (PruneMode::Before(tip + 1), 1, should_prune),

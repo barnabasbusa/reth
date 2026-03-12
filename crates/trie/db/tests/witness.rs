@@ -9,11 +9,21 @@ use alloy_primitives::{
 use alloy_rlp::EMPTY_STRING_CODE;
 use reth_db::{cursor::DbCursorRW, tables};
 use reth_db_api::transaction::DbTxMut;
-use reth_primitives::{Account, StorageEntry};
+use reth_primitives_traits::{Account, StorageEntry};
 use reth_provider::{test_utils::create_test_provider_factory, HashingWriter};
-use reth_trie::{proof::Proof, witness::TrieWitness, HashedPostState, HashedStorage, StateRoot};
-use reth_trie_db::{DatabaseProof, DatabaseStateRoot, DatabaseTrieWitness};
+use reth_storage_api::StorageSettingsCache;
+use reth_trie::{
+    proof::Proof, witness::TrieWitness, HashedPostState, HashedStorage, MultiProofTargets,
+    StateRoot,
+};
+use reth_trie_db::{
+    DatabaseHashedCursorFactory, DatabaseProof, DatabaseStateRoot, DatabaseTrieCursorFactory,
+};
 
+type DbStateRoot<'a, TX, A> =
+    StateRoot<DatabaseTrieCursorFactory<&'a TX, A>, DatabaseHashedCursorFactory<&'a TX>>;
+type DbProof<'a, TX, A> =
+    Proof<DatabaseTrieCursorFactory<&'a TX, A>, DatabaseHashedCursorFactory<&'a TX>>;
 #[test]
 fn includes_empty_node_preimage() {
     let factory = create_test_provider_factory();
@@ -23,40 +33,52 @@ fn includes_empty_node_preimage() {
     let hashed_address = keccak256(address);
     let hashed_slot = B256::random();
 
-    // witness includes empty state trie root node
-    assert_eq!(
-        TrieWitness::from_tx(provider.tx_ref())
+    reth_trie_db::with_adapter!(provider, |A| {
+        // witness includes empty state trie root node
+        assert_eq!(
+            TrieWitness::new(
+                DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+                DatabaseHashedCursorFactory::new(provider.tx_ref()),
+            )
             .compute(HashedPostState {
-                accounts: HashMap::from([(hashed_address, Some(Account::default()))]),
+                accounts: HashMap::from_iter([(hashed_address, Some(Account::default()))]),
                 storages: HashMap::default(),
             })
             .unwrap(),
-        HashMap::from_iter([(EMPTY_ROOT_HASH, Bytes::from([EMPTY_STRING_CODE]))])
-    );
+            HashMap::from_iter([(EMPTY_ROOT_HASH, Bytes::from([EMPTY_STRING_CODE]))])
+        );
 
-    // Insert account into database
-    provider.insert_account_for_hashing([(address, Some(Account::default()))]).unwrap();
+        // Insert account into database
+        provider.insert_account_for_hashing([(address, Some(Account::default()))]).unwrap();
 
-    let state_root = StateRoot::from_tx(provider.tx_ref()).root().unwrap();
-    let multiproof = Proof::from_tx(provider.tx_ref())
-        .multiproof(HashMap::from_iter([(hashed_address, HashSet::from_iter([hashed_slot]))]))
-        .unwrap();
+        let state_root = DbStateRoot::<_, A>::from_tx(provider.tx_ref()).root().unwrap();
+        let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(provider.tx_ref());
+        let multiproof = proof
+            .multiproof(MultiProofTargets::from_iter([(
+                hashed_address,
+                HashSet::from_iter([hashed_slot]),
+            )]))
+            .unwrap();
 
-    let witness = TrieWitness::from_tx(provider.tx_ref())
+        let witness = TrieWitness::new(
+            DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+            DatabaseHashedCursorFactory::new(provider.tx_ref()),
+        )
         .compute(HashedPostState {
-            accounts: HashMap::from([(hashed_address, Some(Account::default()))]),
-            storages: HashMap::from([(
+            accounts: HashMap::from_iter([(hashed_address, Some(Account::default()))]),
+            storages: HashMap::from_iter([(
                 hashed_address,
                 HashedStorage::from_iter(false, [(hashed_slot, U256::from(1))]),
             )]),
         })
         .unwrap();
-    assert!(witness.contains_key(&state_root));
-    for node in multiproof.account_subtree.values() {
-        assert_eq!(witness.get(&keccak256(node)), Some(node));
-    }
-    // witness includes empty state trie root node
-    assert_eq!(witness.get(&EMPTY_ROOT_HASH), Some(&Bytes::from([EMPTY_STRING_CODE])));
+        assert!(witness.contains_key(&state_root));
+        for node in multiproof.account_subtree.values() {
+            assert_eq!(witness.get(&keccak256(node)), Some(node));
+        }
+        // witness includes empty state trie root node
+        assert_eq!(witness.get(&EMPTY_ROOT_HASH), Some(&Bytes::from([EMPTY_STRING_CODE])));
+    });
 }
 
 #[test]
@@ -75,24 +97,37 @@ fn includes_nodes_for_destroyed_storage_nodes() {
         .insert_storage_for_hashing([(address, [StorageEntry { key: slot, value: U256::from(1) }])])
         .unwrap();
 
-    let state_root = StateRoot::from_tx(provider.tx_ref()).root().unwrap();
-    let multiproof = Proof::from_tx(provider.tx_ref())
-        .multiproof(HashMap::from_iter([(hashed_address, HashSet::from_iter([hashed_slot]))]))
-        .unwrap();
+    reth_trie_db::with_adapter!(provider, |A| {
+        let state_root = DbStateRoot::<_, A>::from_tx(provider.tx_ref()).root().unwrap();
+        let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(provider.tx_ref());
+        let multiproof = proof
+            .multiproof(MultiProofTargets::from_iter([(
+                hashed_address,
+                HashSet::from_iter([hashed_slot]),
+            )]))
+            .unwrap();
 
-    let witness = TrieWitness::from_tx(provider.tx_ref())
-        .compute(HashedPostState {
-            accounts: HashMap::from([(hashed_address, Some(Account::default()))]),
-            storages: HashMap::from([(hashed_address, HashedStorage::from_iter(true, []))]), // destroyed
-        })
-        .unwrap();
-    assert!(witness.contains_key(&state_root));
-    for node in multiproof.account_subtree.values() {
-        assert_eq!(witness.get(&keccak256(node)), Some(node));
-    }
-    for node in multiproof.storages.iter().flat_map(|(_, storage)| storage.subtree.values()) {
-        assert_eq!(witness.get(&keccak256(node)), Some(node));
-    }
+        let witness =
+            TrieWitness::new(
+                DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+                DatabaseHashedCursorFactory::new(provider.tx_ref()),
+            )
+            .compute(HashedPostState {
+                accounts: HashMap::from_iter([(hashed_address, Some(Account::default()))]),
+                storages: HashMap::from_iter([(
+                    hashed_address,
+                    HashedStorage::from_iter(true, []),
+                )]), // destroyed
+            })
+            .unwrap();
+        assert!(witness.contains_key(&state_root));
+        for node in multiproof.account_subtree.values() {
+            assert_eq!(witness.get(&keccak256(node)), Some(node));
+        }
+        for node in multiproof.storages.values().flat_map(|storage| storage.subtree.values()) {
+            assert_eq!(witness.get(&keccak256(node)), Some(node));
+        }
+    });
 }
 
 #[test]
@@ -102,32 +137,37 @@ fn correctly_decodes_branch_node_values() {
 
     let address = Address::random();
     let hashed_address = keccak256(address);
-    let hashed_slot1 = B256::with_last_byte(1);
-    let hashed_slot2 = B256::with_last_byte(2);
+    let hashed_slot1 = B256::repeat_byte(1);
+    let hashed_slot2 = B256::repeat_byte(2);
 
     // Insert account and slots into database
     provider.insert_account_for_hashing([(address, Some(Account::default()))]).unwrap();
     let mut hashed_storage_cursor =
         provider.tx_ref().cursor_dup_write::<tables::HashedStorages>().unwrap();
     hashed_storage_cursor
-        .upsert(hashed_address, StorageEntry { key: hashed_slot1, value: U256::from(1) })
+        .upsert(hashed_address, &StorageEntry { key: hashed_slot1, value: U256::from(1) })
         .unwrap();
     hashed_storage_cursor
-        .upsert(hashed_address, StorageEntry { key: hashed_slot2, value: U256::from(1) })
+        .upsert(hashed_address, &StorageEntry { key: hashed_slot2, value: U256::from(1) })
         .unwrap();
 
-    let state_root = StateRoot::from_tx(provider.tx_ref()).root().unwrap();
-    let multiproof = Proof::from_tx(provider.tx_ref())
-        .multiproof(HashMap::from_iter([(
-            hashed_address,
-            HashSet::from_iter([hashed_slot1, hashed_slot2]),
-        )]))
-        .unwrap();
+    reth_trie_db::with_adapter!(provider, |A| {
+        let state_root = DbStateRoot::<_, A>::from_tx(provider.tx_ref()).root().unwrap();
+        let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(provider.tx_ref());
+        let multiproof = proof
+            .multiproof(MultiProofTargets::from_iter([(
+                hashed_address,
+                HashSet::from_iter([hashed_slot1, hashed_slot2]),
+            )]))
+            .unwrap();
 
-    let witness = TrieWitness::from_tx(provider.tx_ref())
+        let witness = TrieWitness::new(
+            DatabaseTrieCursorFactory::<_, A>::new(provider.tx_ref()),
+            DatabaseHashedCursorFactory::new(provider.tx_ref()),
+        )
         .compute(HashedPostState {
-            accounts: HashMap::from([(hashed_address, Some(Account::default()))]),
-            storages: HashMap::from([(
+            accounts: HashMap::from_iter([(hashed_address, Some(Account::default()))]),
+            storages: HashMap::from_iter([(
                 hashed_address,
                 HashedStorage::from_iter(
                     false,
@@ -136,11 +176,12 @@ fn correctly_decodes_branch_node_values() {
             )]),
         })
         .unwrap();
-    assert!(witness.contains_key(&state_root));
-    for node in multiproof.account_subtree.values() {
-        assert_eq!(witness.get(&keccak256(node)), Some(node));
-    }
-    for node in multiproof.storages.iter().flat_map(|(_, storage)| storage.subtree.values()) {
-        assert_eq!(witness.get(&keccak256(node)), Some(node));
-    }
+        assert!(witness.contains_key(&state_root));
+        for node in multiproof.account_subtree.values() {
+            assert_eq!(witness.get(&keccak256(node)), Some(node));
+        }
+        for node in multiproof.storages.values().flat_map(|storage| storage.subtree.values()) {
+            assert_eq!(witness.get(&keccak256(node)), Some(node));
+        }
+    });
 }

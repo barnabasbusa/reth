@@ -9,7 +9,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Shared abstractions for downloader implementations.
 pub mod download;
@@ -17,11 +17,15 @@ pub mod download;
 /// Traits for implementing P2P block body clients.
 pub mod bodies;
 
+/// Traits for implementing P2P receipt clients.
+pub mod receipts;
+
 /// A downloader that combines two different downloaders/client implementations.
 pub mod either;
 
 /// An implementation that uses headers and bodies traits to download full blocks
 pub mod full_block;
+pub use full_block::{FullBlockClient, NoopFullBlockClient};
 
 /// Traits for implementing P2P Header Clients. Also includes implementations
 /// of a Linear and a Parallel downloader generic over the [`Consensus`] and
@@ -41,14 +45,30 @@ pub mod priority;
 /// Syncing related traits.
 pub mod sync;
 
+/// Snap related traits.
+pub mod snap;
+
 /// Common test helpers for mocking out Consensus, Downloaders and Header Clients.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
 pub use bodies::client::BodiesClient;
 pub use headers::client::HeadersClient;
+pub use receipts::client::ReceiptsClient;
+use reth_primitives_traits::Block;
 
-/// Helper trait that unifies network behaviour needed for fetching blocks.
-pub trait BlockClient: HeadersClient + BodiesClient + Unpin + Clone {}
+/// Helper trait that unifies network behaviour needed for fetching entire blocks.
+pub trait BlockClient:
+    HeadersClient<Header = <Self::Block as Block>::Header>
+    + BodiesClient<Body = <Self::Block as Block>::Body>
+    + Unpin
+    + Clone
+{
+    /// The Block type that this client fetches.
+    type Block: Block;
+}
 
-impl<T> BlockClient for T where T: HeadersClient + BodiesClient + Unpin + Clone {}
+/// The [`BlockClient`] providing Ethereum block parts.
+pub trait EthBlockClient: BlockClient<Block = reth_ethereum_primitives::Block> {}
+
+impl<T> EthBlockClient for T where T: BlockClient<Block = reth_ethereum_primitives::Block> {}

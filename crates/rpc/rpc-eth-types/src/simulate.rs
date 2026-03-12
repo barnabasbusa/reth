@@ -1,30 +1,45 @@
 //! Utilities for serving `eth_simulateV1`
 
-use alloy_consensus::{Transaction as _, TxEip4844Variant, TxType, TypedTransaction};
-use alloy_primitives::Parity;
-use alloy_rpc_types::{
-    simulate::{SimCallResult, SimulateError, SimulatedBlock},
-    Block, BlockTransactionsKind,
-};
-use alloy_rpc_types_eth::transaction::TransactionRequest;
-use jsonrpsee_types::ErrorObject;
-use reth_primitives::{
-    proofs::{calculate_receipt_root, calculate_transaction_root},
-    BlockBody, BlockWithSenders, Receipt, Signature, Transaction, TransactionSigned,
-    TransactionSignedNoHash,
-};
-use reth_revm::database::StateProviderDatabase;
-use reth_rpc_server_types::result::rpc_err;
-use reth_rpc_types_compat::{block::from_block, TransactionCompat};
-use reth_storage_api::StateRootProvider;
-use reth_trie::{HashedPostState, HashedStorage};
-use revm::{db::CacheDB, Database};
-use revm_primitives::{keccak256, Address, BlockEnv, Bytes, ExecutionResult, TxKind, B256, U256};
-
 use crate::{
-    cache::db::StateProviderTraitObjWrapper, error::ToRpcError, EthApiError, RevertError,
-    RpcInvalidTransactionError,
+    error::{api::FromEthApiError, FromEvmError, ToRpcError},
+    EthApiError,
 };
+use alloy_consensus::{transaction::TxHashRef, BlockHeader, Transaction as _};
+use alloy_eips::eip2718::WithEncoded;
+use alloy_evm::precompiles::PrecompilesMap;
+use alloy_network::TransactionBuilder;
+use alloy_rpc_types_eth::{
+    simulate::{SimCallResult, SimulateError, SimulatedBlock},
+    state::StateOverride,
+    BlockTransactionsKind,
+};
+use jsonrpsee_types::ErrorObject;
+use reth_evm::{
+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
+    Evm, HaltReasonFor,
+};
+use reth_primitives_traits::{BlockBody as _, BlockTy, NodePrimitives, Recovered, RecoveredBlock};
+use reth_rpc_convert::{RpcBlock, RpcConvert, RpcTxReq};
+use reth_rpc_server_types::result::rpc_err;
+use reth_storage_api::noop::NoopProvider;
+use revm::{
+    context::Block,
+    context_interface::result::ExecutionResult,
+    primitives::{Address, Bytes, TxKind, U256},
+    Database,
+};
+
+/// Error code for execution reverted in `eth_simulateV1`.
+///
+/// Consistent with `eth_call` revert error code.
+///
+/// <https://github.com/ethereum/execution-apis/pull/748>
+pub const SIMULATE_REVERT_CODE: i32 = 3;
+
+/// Error code for VM execution errors (e.g., out of gas) in `eth_simulateV1`.
+///
+/// <https://github.com/ethereum/execution-apis>
+pub const SIMULATE_VM_ERROR_CODE: i32 = -32015;
 
 /// Errors which may occur during `eth_simulateV1` execution.
 #[derive(Debug, thiserror::Error)]
@@ -32,16 +47,80 @@ pub enum EthSimulateError {
     /// Total gas limit of transactions for the block exceeds the block gas limit.
     #[error("Block gas limit exceeded by the block's transactions")]
     BlockGasLimitExceeded,
+    /// Number of simulated blocks exceeds the configured client limit.
+    #[error("too many blocks")]
+    TooManyBlocks,
     /// Max gas limit for entire operation exceeded.
     #[error("Client adjustable limit reached")]
     GasLimitReached,
+    /// Block number in sequence did not increase.
+    #[error("block numbers must be in order: {got} <= {parent}")]
+    BlockNumberInvalid {
+        /// The block number that was provided.
+        got: u64,
+        /// The parent block number.
+        parent: u64,
+    },
+    /// Block timestamp in sequence did not increase.
+    #[error("block timestamps must be in order: {got} <= {parent}")]
+    BlockTimestampInvalid {
+        /// The block timestamp that was provided.
+        got: u64,
+        /// The parent block timestamp.
+        parent: u64,
+    },
+    /// Transaction nonce is too low.
+    #[error("nonce too low: next nonce {state}, tx nonce {tx}")]
+    NonceTooLow {
+        /// Transaction nonce.
+        tx: u64,
+        /// Current state nonce.
+        state: u64,
+    },
+    /// Transaction nonce is too high.
+    #[error("nonce too high")]
+    NonceTooHigh,
+    /// Transaction's baseFeePerGas is too low.
+    #[error("max fee per gas less than block base fee")]
+    BaseFeePerGasTooLow,
+    /// Not enough gas provided to pay for intrinsic gas.
+    #[error("intrinsic gas too low")]
+    IntrinsicGasTooLow,
+    /// Insufficient funds to pay for gas fees and value.
+    #[error("insufficient funds for gas * price + value: have {balance} want {cost}")]
+    InsufficientFunds {
+        /// Transaction cost.
+        cost: U256,
+        /// Sender balance.
+        balance: U256,
+    },
+    /// Sender is not an EOA.
+    #[error("sender is not an EOA")]
+    SenderNotEOA,
+    /// Max init code size exceeded.
+    #[error("max initcode size exceeded")]
+    MaxInitCodeSizeExceeded,
+    /// Attempted to move a non-precompile address.
+    #[error("account {0} is not a precompile")]
+    NotAPrecompile(Address),
 }
 
 impl EthSimulateError {
-    const fn error_code(&self) -> i32 {
+    /// Returns the JSON-RPC error code for a `eth_simulateV1` error.
+    pub const fn error_code(&self) -> i32 {
         match self {
+            Self::NonceTooLow { .. } => -38010,
+            Self::NonceTooHigh => -38011,
+            Self::BaseFeePerGasTooLow => -38012,
+            Self::IntrinsicGasTooLow => -38013,
+            Self::InsufficientFunds { .. } => -38014,
             Self::BlockGasLimitExceeded => -38015,
-            Self::GasLimitReached => -38026,
+            Self::BlockNumberInvalid { .. } => -38020,
+            Self::BlockTimestampInvalid { .. } => -38021,
+            Self::SenderNotEOA => -38024,
+            Self::MaxInitCodeSizeExceeded => -38025,
+            Self::TooManyBlocks | Self::GasLimitReached => -38026,
+            Self::NotAPrecompile(_) => -32000,
         }
     }
 }
@@ -52,261 +131,247 @@ impl ToRpcError for EthSimulateError {
     }
 }
 
-/// Goes over the list of [`TransactionRequest`]s and populates missing fields trying to resolve
-/// them into [`TransactionSigned`].
+/// Applies precompile move overrides from state overrides to the EVM's precompiles map.
 ///
-/// If validation is enabled, the function will return error if any of the transactions can't be
-/// built right away.
-pub fn resolve_transactions<DB: Database>(
-    txs: &mut [TransactionRequest],
-    validation: bool,
-    block_gas_limit: u64,
+/// This function processes `movePrecompileToAddress` entries from the state overrides and
+/// moves precompiles from their original addresses to new addresses. The original address
+/// is cleared (precompile removed) and the precompile is installed at the destination address.
+pub fn apply_precompile_overrides(
+    state_overrides: &StateOverride,
+    precompiles: &mut PrecompilesMap,
+) -> Result<(), EthSimulateError> {
+    let moves: Vec<_> = state_overrides
+        .iter()
+        .filter_map(|(source, account_override)| {
+            account_override.move_precompile_to.map(|dest| (*source, dest))
+        })
+        .collect();
+
+    precompiles.move_precompiles(moves).map_err(
+        |alloy_evm::precompiles::MovePrecompileError::NotAPrecompile(addr)| {
+            EthSimulateError::NotAPrecompile(addr)
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Converts all [`TransactionRequest`]s into [`Recovered`] transactions and applies them to the
+/// given [`BlockExecutor`].
+///
+/// Returns all executed transactions and the result of the execution.
+///
+/// [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
+#[expect(clippy::type_complexity)]
+pub fn execute_transactions<S, T>(
+    mut builder: S,
+    calls: Vec<RpcTxReq<T::Network>>,
+    default_gas_limit: u64,
     chain_id: u64,
-    db: &mut DB,
-) -> Result<Vec<TransactionSigned>, EthApiError>
+    converter: &T,
+) -> Result<
+    (
+        BlockBuilderOutcome<S::Primitives>,
+        Vec<ExecutionResult<<<S::Executor as BlockExecutor>::Evm as Evm>::HaltReason>>,
+    ),
+    EthApiError,
+>
 where
-    EthApiError: From<DB::Error>,
+    S: BlockBuilder<Executor: BlockExecutor<Evm: Evm<DB: Database<Error: Into<EthApiError>>>>>,
+    T: RpcConvert<Primitives = S::Primitives>,
 {
-    let mut transactions = Vec::with_capacity(txs.len());
+    builder.apply_pre_execution_changes()?;
 
-    let default_gas_limit = {
-        let total_specified_gas = txs.iter().filter_map(|tx| tx.gas).sum::<u64>();
-        let txs_without_gas_limit = txs.iter().filter(|tx| tx.gas.is_none()).count();
+    let mut results = Vec::with_capacity(calls.len());
+    for call in calls {
+        // Resolve transaction, populate missing fields and enforce calls
+        // correctness.
+        let tx = resolve_transaction(
+            call,
+            default_gas_limit,
+            builder.evm().block().basefee(),
+            chain_id,
+            builder.evm_mut().db_mut(),
+            converter,
+        )?;
+        // Create transaction with an empty envelope.
+        // The effect for a layer-2 execution client is that it does not charge L1 cost.
+        let tx = WithEncoded::new(Default::default(), tx);
 
-        if total_specified_gas > block_gas_limit {
-            return Err(EthApiError::Other(Box::new(EthSimulateError::BlockGasLimitExceeded)))
-        }
-
-        if txs_without_gas_limit > 0 {
-            (block_gas_limit - total_specified_gas) / txs_without_gas_limit as u64
-        } else {
-            0
-        }
-    };
-
-    for tx in txs {
-        if tx.buildable_type().is_none() && validation {
-            return Err(EthApiError::TransactionConversionError);
-        }
-        // If we're missing any fields and validation is disabled, we try filling nonce, gas and
-        // gas price.
-        let tx_type = tx.preferred_type();
-
-        let from = if let Some(from) = tx.from {
-            from
-        } else {
-            tx.from = Some(Address::ZERO);
-            Address::ZERO
-        };
-
-        if tx.nonce.is_none() {
-            tx.nonce = Some(db.basic(from)?.map(|acc| acc.nonce).unwrap_or_default());
-        }
-
-        if tx.gas.is_none() {
-            tx.gas = Some(default_gas_limit);
-        }
-
-        if tx.chain_id.is_none() {
-            tx.chain_id = Some(chain_id);
-        }
-
-        if tx.to.is_none() {
-            tx.to = Some(TxKind::Create);
-        }
-
-        match tx_type {
-            TxType::Legacy | TxType::Eip2930 => {
-                if tx.gas_price.is_none() {
-                    tx.gas_price = Some(0);
-                }
-            }
-            _ => {
-                if tx.max_fee_per_gas.is_none() {
-                    tx.max_fee_per_gas = Some(0);
-                    tx.max_priority_fee_per_gas = Some(0);
-                }
-            }
-        }
-
-        let Ok(tx) = tx.clone().build_typed_tx() else {
-            return Err(EthApiError::TransactionConversionError)
-        };
-
-        // Create an empty signature for the transaction.
-        let signature =
-            Signature::new(Default::default(), Default::default(), Parity::Parity(false));
-
-        let tx = match tx {
-            TypedTransaction::Legacy(tx) => {
-                TransactionSignedNoHash { transaction: Transaction::Legacy(tx), signature }
-                    .with_hash()
-            }
-            TypedTransaction::Eip2930(tx) => {
-                TransactionSignedNoHash { transaction: Transaction::Eip2930(tx), signature }
-                    .with_hash()
-            }
-            TypedTransaction::Eip1559(tx) => {
-                TransactionSignedNoHash { transaction: Transaction::Eip1559(tx), signature }
-                    .with_hash()
-            }
-            TypedTransaction::Eip4844(tx) => {
-                let tx = match tx {
-                    TxEip4844Variant::TxEip4844(tx) => tx,
-                    TxEip4844Variant::TxEip4844WithSidecar(tx) => tx.tx,
-                };
-                TransactionSignedNoHash { transaction: Transaction::Eip4844(tx), signature }
-                    .with_hash()
-            }
-            TypedTransaction::Eip7702(tx) => {
-                TransactionSignedNoHash { transaction: Transaction::Eip7702(tx), signature }
-                    .with_hash()
-            }
-        };
-
-        transactions.push(tx);
+        builder
+            .execute_transaction_with_result_closure(tx, |result| results.push(result.clone()))?;
     }
 
-    Ok(transactions)
+    // Pass noop provider to skip state root calculations.
+    let result = builder.finish(NoopProvider::default())?;
+
+    Ok((result, results))
+}
+
+/// Goes over the list of [`TransactionRequest`]s and populates missing fields trying to resolve
+/// them into primitive transactions.
+///
+/// This will set the defaults as defined in <https://github.com/ethereum/execution-apis/blob/e56d3208789259d0b09fa68e9d8594aa4d73c725/docs/ethsimulatev1-notes.md#default-values-for-transactions>
+///
+/// [`TransactionRequest`]: alloy_rpc_types_eth::TransactionRequest
+pub fn resolve_transaction<DB: Database, Tx, T>(
+    mut tx: RpcTxReq<T::Network>,
+    default_gas_limit: u64,
+    block_base_fee_per_gas: u64,
+    chain_id: u64,
+    db: &mut DB,
+    converter: &T,
+) -> Result<Recovered<Tx>, EthApiError>
+where
+    DB::Error: Into<EthApiError>,
+    T: RpcConvert<Primitives: NodePrimitives<SignedTx = Tx>>,
+{
+    // If we're missing any fields we try to fill nonce, gas and
+    // gas price.
+    let tx_type = tx.as_ref().output_tx_type();
+
+    let from = if let Some(from) = tx.as_ref().from() {
+        from
+    } else {
+        tx.as_mut().set_from(Address::ZERO);
+        Address::ZERO
+    };
+
+    if tx.as_ref().nonce().is_none() {
+        tx.as_mut().set_nonce(
+            db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default(),
+        );
+    }
+
+    if tx.as_ref().gas_limit().is_none() {
+        tx.as_mut().set_gas_limit(default_gas_limit);
+    }
+
+    if tx.as_ref().chain_id().is_none() {
+        tx.as_mut().set_chain_id(chain_id);
+    }
+
+    if tx.as_ref().kind().is_none() {
+        tx.as_mut().set_kind(TxKind::Create);
+    }
+
+    // if we can't build the _entire_ transaction yet, we need to check the fee values
+    if tx.as_ref().output_tx_type_checked().is_none() {
+        if tx_type.is_legacy() || tx_type.is_eip2930() {
+            if tx.as_ref().gas_price().is_none() {
+                tx.as_mut().set_gas_price(block_base_fee_per_gas as u128);
+            }
+        } else {
+            // set dynamic 1559 fees
+            if tx.as_ref().max_fee_per_gas().is_none() {
+                let mut max_fee_per_gas = block_base_fee_per_gas as u128;
+                if let Some(prio_fee) = tx.as_ref().max_priority_fee_per_gas() {
+                    // if a prio fee is provided we need to select the max fee accordingly
+                    // because the base fee must be higher than the prio fee.
+                    max_fee_per_gas = prio_fee.max(max_fee_per_gas);
+                }
+                tx.as_mut().set_max_fee_per_gas(max_fee_per_gas);
+            }
+            if tx.as_ref().max_priority_fee_per_gas().is_none() {
+                tx.as_mut().set_max_priority_fee_per_gas(0);
+            }
+        }
+    }
+
+    let tx =
+        converter.build_simulate_v1_transaction(tx).map_err(|e| EthApiError::other(e.into()))?;
+
+    Ok(Recovered::new_unchecked(tx, from))
 }
 
 /// Handles outputs of the calls execution and builds a [`SimulatedBlock`].
-#[expect(clippy::too_many_arguments)]
-pub fn build_block<T: TransactionCompat>(
-    results: Vec<(Address, ExecutionResult)>,
-    transactions: Vec<TransactionSigned>,
-    block_env: &BlockEnv,
-    parent_hash: B256,
-    total_difficulty: U256,
-    full_transactions: bool,
-    db: &CacheDB<StateProviderDatabase<StateProviderTraitObjWrapper<'_>>>,
-    tx_resp_builder: &T,
-) -> Result<SimulatedBlock<Block<T::Transaction>>, EthApiError> {
+pub fn build_simulated_block<Err, T>(
+    block: RecoveredBlock<BlockTy<T::Primitives>>,
+    results: Vec<ExecutionResult<HaltReasonFor<T::Evm>>>,
+    txs_kind: BlockTransactionsKind,
+    converter: &T,
+) -> Result<SimulatedBlock<RpcBlock<T::Network>>, Err>
+where
+    Err: std::error::Error
+        + FromEthApiError
+        + FromEvmError<T::Evm>
+        + From<T::Error>
+        + Into<jsonrpsee_types::ErrorObject<'static>>,
+    T: RpcConvert,
+{
     let mut calls: Vec<SimCallResult> = Vec::with_capacity(results.len());
-    let mut senders = Vec::with_capacity(results.len());
-    let mut receipts = Vec::with_capacity(results.len());
 
     let mut log_index = 0;
-    for (transaction_index, ((sender, result), tx)) in
-        results.into_iter().zip(transactions.iter()).enumerate()
-    {
-        senders.push(sender);
-
+    for (index, (result, tx)) in results.into_iter().zip(block.body().transactions()).enumerate() {
         let call = match result {
-            ExecutionResult::Halt { reason, gas_used } => {
-                let error = RpcInvalidTransactionError::halt(reason, tx.gas_limit());
+            ExecutionResult::Halt { reason, gas, .. } => {
+                let error = Err::from_evm_halt(reason, tx.gas_limit());
+                #[allow(clippy::needless_update)]
                 SimCallResult {
                     return_data: Bytes::new(),
                     error: Some(SimulateError {
-                        code: error.error_code(),
                         message: error.to_string(),
+                        code: SIMULATE_VM_ERROR_CODE,
+                        ..SimulateError::invalid_params()
                     }),
-                    gas_used,
+                    gas_used: gas.used(),
                     logs: Vec::new(),
                     status: false,
+                    ..Default::default()
                 }
             }
-            ExecutionResult::Revert { output, gas_used } => {
-                let error = RevertError::new(output.clone());
+            ExecutionResult::Revert { output, gas, .. } => {
+                let error = Err::from_revert(output.clone());
+                #[allow(clippy::needless_update)]
                 SimCallResult {
                     return_data: output,
                     error: Some(SimulateError {
-                        code: error.error_code(),
                         message: error.to_string(),
+                        code: SIMULATE_REVERT_CODE,
+                        ..SimulateError::invalid_params()
                     }),
-                    gas_used,
+                    gas_used: gas.used(),
                     status: false,
                     logs: Vec::new(),
+                    ..Default::default()
                 }
             }
-            ExecutionResult::Success { output, gas_used, logs, .. } => SimCallResult {
-                return_data: output.into_data(),
-                error: None,
-                gas_used,
-                logs: logs
-                    .into_iter()
-                    .map(|log| {
-                        log_index += 1;
-                        alloy_rpc_types::Log {
-                            inner: log,
-                            log_index: Some(log_index - 1),
-                            transaction_index: Some(transaction_index as u64),
-                            transaction_hash: Some(tx.hash()),
-                            block_number: Some(block_env.number.to()),
-                            block_timestamp: Some(block_env.timestamp.to()),
-                            ..Default::default()
-                        }
-                    })
-                    .collect(),
-                status: true,
-            },
-        };
-
-        receipts.push(
-            #[allow(clippy::needless_update)]
-            Receipt {
-                tx_type: tx.tx_type(),
-                success: call.status,
-                cumulative_gas_used: call.gas_used + calls.iter().map(|c| c.gas_used).sum::<u64>(),
-                logs: call.logs.iter().map(|log| &log.inner).cloned().collect(),
-                ..Default::default()
+            ExecutionResult::Success { output, gas, logs, .. } =>
+            {
+                #[allow(clippy::needless_update)]
+                SimCallResult {
+                    return_data: output.into_data(),
+                    error: None,
+                    gas_used: gas.used(),
+                    logs: logs
+                        .into_iter()
+                        .map(|log| {
+                            log_index += 1;
+                            alloy_rpc_types_eth::Log {
+                                inner: log,
+                                log_index: Some(log_index - 1),
+                                transaction_index: Some(index as u64),
+                                transaction_hash: Some(*tx.tx_hash()),
+                                block_hash: Some(block.hash()),
+                                block_number: Some(block.header().number()),
+                                block_timestamp: Some(block.header().timestamp()),
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                    status: true,
+                    ..Default::default()
+                }
             }
-            .into(),
-        );
+        };
 
         calls.push(call);
     }
 
-    let mut hashed_state = HashedPostState::default();
-    for (address, account) in &db.accounts {
-        let hashed_address = keccak256(address);
-        hashed_state.accounts.insert(hashed_address, Some(account.info.clone().into()));
-
-        let storage = hashed_state
-            .storages
-            .entry(hashed_address)
-            .or_insert_with(|| HashedStorage::new(account.account_state.is_storage_cleared()));
-
-        for (slot, value) in &account.storage {
-            let slot = B256::from(*slot);
-            let hashed_slot = keccak256(slot);
-            storage.storage.insert(hashed_slot, *value);
-        }
-    }
-
-    let state_root = db.db.0.state_root(hashed_state)?;
-
-    let header = reth_primitives::Header {
-        beneficiary: block_env.coinbase,
-        difficulty: block_env.difficulty,
-        number: block_env.number.to(),
-        timestamp: block_env.timestamp.to(),
-        base_fee_per_gas: Some(block_env.basefee.to()),
-        gas_limit: block_env.gas_limit.to(),
-        gas_used: calls.iter().map(|c| c.gas_used).sum::<u64>(),
-        blob_gas_used: Some(0),
-        parent_hash,
-        receipts_root: calculate_receipt_root(&receipts),
-        transactions_root: calculate_transaction_root(&transactions),
-        state_root,
-        logs_bloom: alloy_primitives::logs_bloom(
-            receipts.iter().flat_map(|r| r.receipt.logs.iter()),
-        ),
-        mix_hash: block_env.prevrandao.unwrap_or_default(),
-        ..Default::default()
-    };
-
-    let block = BlockWithSenders {
-        block: reth_primitives::Block {
-            header,
-            body: BlockBody { transactions, ..Default::default() },
-        },
-        senders,
-    };
-
-    let txs_kind =
-        if full_transactions { BlockTransactionsKind::Full } else { BlockTransactionsKind::Hashes };
-
-    let block = from_block(block, total_difficulty, txs_kind, None, tx_resp_builder)?;
+    let block = block.into_rpc_block(
+        txs_kind,
+        |tx, tx_info| converter.fill(tx, tx_info),
+        |header, size| converter.convert_header(header, size),
+    )?;
     Ok(SimulatedBlock { inner: block, calls })
 }

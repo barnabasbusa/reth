@@ -10,21 +10,17 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error as StdError,
     fs::File,
+    io::{self, Read, Write},
     ops::Range,
     path::{Path, PathBuf},
 };
-
-// Windows specific extension for std::fs
-#[cfg(windows)]
-use std::os::windows::prelude::OpenOptionsExt;
-
 use tracing::*;
 
 /// Compression algorithms supported by `NippyJar`.
@@ -63,6 +59,8 @@ const INDEX_FILE_EXTENSION: &str = "idx";
 const OFFSETS_FILE_EXTENSION: &str = "off";
 /// The file extension used for configuration files.
 pub const CONFIG_FILE_EXTENSION: &str = "conf";
+/// The file extension used for changeset offset sidecar files.
+pub const CHANGESET_OFFSETS_FILE_EXTENSION: &str = "csoff";
 
 /// A [`RefRow`] is a list of column value slices pointing to either an internal buffer or a
 /// memory-mapped file.
@@ -193,7 +191,7 @@ impl<H: NippyJarHeader> NippyJar<H> {
     }
 
     /// Gets a mutable reference to the compressor.
-    pub fn compressor_mut(&mut self) -> Option<&mut Compressors> {
+    pub const fn compressor_mut(&mut self) -> Option<&mut Compressors> {
         self.compressor.as_mut()
     }
 
@@ -204,11 +202,24 @@ impl<H: NippyJarHeader> NippyJar<H> {
         // Read [`Self`] located at the data file.
         let config_path = path.with_extension(CONFIG_FILE_EXTENSION);
         let config_file = File::open(&config_path)
+            .inspect_err(|e| {
+                warn!(?path, %e, "Failed to load static file jar");
+            })
             .map_err(|err| reth_fs_util::FsPathError::open(err, config_path))?;
 
-        let mut obj: Self = bincode::deserialize_from(&config_file)?;
+        let mut obj = Self::load_from_reader(io::BufReader::new(config_file))?;
         obj.path = path.to_path_buf();
         Ok(obj)
+    }
+
+    /// Deserializes an instance of [`Self`] from a [`Read`] type.
+    pub fn load_from_reader<R: Read>(reader: R) -> Result<Self, NippyJarError> {
+        Ok(bincode::deserialize_from(reader)?)
+    }
+
+    /// Serializes an instance of [`Self`] to a [`Write`] type.
+    pub fn save_to_writer<W: Write>(&self, writer: W) -> Result<(), NippyJarError> {
+        Ok(bincode::serialize_into(writer, self)?)
     }
 
     /// Returns the path for the data file
@@ -231,14 +242,24 @@ impl<H: NippyJarHeader> NippyJar<H> {
         self.path.with_extension(CONFIG_FILE_EXTENSION)
     }
 
+    /// Returns the path for the changeset offsets sidecar file.
+    pub fn changeset_offsets_path(&self) -> PathBuf {
+        self.path.with_extension(CHANGESET_OFFSETS_FILE_EXTENSION)
+    }
+
     /// Deletes from disk this [`NippyJar`] alongside every satellite file.
     pub fn delete(self) -> Result<(), NippyJarError> {
         // TODO(joshie): ensure consistency on unexpected shutdown
 
-        for path in
-            [self.data_path().into(), self.index_path(), self.offsets_path(), self.config_path()]
-        {
+        for path in [
+            self.data_path().into(),
+            self.index_path(),
+            self.offsets_path(),
+            self.config_path(),
+            self.changeset_offsets_path(),
+        ] {
             if path.exists() {
+                debug!(target: "nippy-jar", ?path, "Removing file.");
                 reth_fs_util::remove_file(path)?;
             }
         }
@@ -253,9 +274,7 @@ impl<H: NippyJarHeader> NippyJar<H> {
 
     /// Writes all necessary configuration to file.
     fn freeze_config(&self) -> Result<(), NippyJarError> {
-        Ok(reth_fs_util::atomic_write_file(&self.config_path(), |file| {
-            bincode::serialize_into(file, &self)
-        })?)
+        Ok(reth_fs_util::atomic_write_file(&self.config_path(), |file| self.save_to_writer(file))?)
     }
 }
 
@@ -307,10 +326,10 @@ impl<H: NippyJarHeader> NippyJar<H> {
             return Err(NippyJarError::ColumnLenMismatch(self.columns, columns.len()))
         }
 
-        if let Some(compression) = &self.compressor {
-            if !compression.is_ready() {
-                return Err(NippyJarError::CompressorNotReady)
-            }
+        if let Some(compression) = &self.compressor &&
+            !compression.is_ready()
+        {
+            return Err(NippyJarError::CompressorNotReady)
         }
 
         Ok(())
@@ -323,12 +342,11 @@ impl<H: NippyJarHeader> NippyJar<H> {
 #[derive(Debug)]
 pub struct DataReader {
     /// Data file descriptor. Needs to be kept alive as long as `data_mmap` handle.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     data_file: File,
     /// Mmap handle for data.
     data_mmap: Mmap,
     /// Offset file descriptor. Needs to be kept alive as long as `offset_mmap` handle.
-    #[allow(dead_code)]
     offset_file: File,
     /// Mmap handle for offsets.
     offset_mmap: Mmap,
@@ -411,9 +429,14 @@ impl DataReader {
         &self.data_mmap[range]
     }
 
-    /// Returns total size of data
+    /// Returns total size of data file.
     pub fn size(&self) -> usize {
         self.data_mmap.len()
+    }
+
+    /// Returns total size of offsets file.
+    pub fn offsets_size(&self) -> usize {
+        self.offset_mmap.len()
     }
 }
 
@@ -432,9 +455,9 @@ mod tests {
         let num_rows = 100;
 
         let mut vec: Vec<u8> = vec![0; value_length];
-        let mut rng = seed.map(SmallRng::seed_from_u64).unwrap_or_else(SmallRng::from_entropy);
+        let mut rng = seed.map(SmallRng::seed_from_u64).unwrap_or_else(SmallRng::from_os_rng);
 
-        let mut gen = || {
+        let mut entry_gen = || {
             (0..num_rows)
                 .map(|_| {
                     rng.fill_bytes(&mut vec[..]);
@@ -443,7 +466,7 @@ mod tests {
                 .collect()
         };
 
-        (gen(), gen())
+        (entry_gen(), entry_gen())
     }
 
     fn clone_with_result(col: &ColumnValues) -> ColumnResults<Vec<u8>> {
@@ -678,7 +701,7 @@ mod tests {
 
                 // Shuffled for chaos.
                 let mut data = col1.iter().zip(col2.iter()).enumerate().collect::<Vec<_>>();
-                data.shuffle(&mut rand::thread_rng());
+                data.shuffle(&mut rand::rng());
 
                 for (row_num, (v0, v1)) in data {
                     // Simulates `by_number` queries
@@ -716,7 +739,7 @@ mod tests {
 
                 // Shuffled for chaos.
                 let mut data = col1.iter().zip(col2.iter()).enumerate().collect::<Vec<_>>();
-                data.shuffle(&mut rand::thread_rng());
+                data.shuffle(&mut rand::rng());
 
                 // Imagine `Blocks` static file has two columns: `Block | StoredWithdrawals`
                 const BLOCKS_FULL_MASK: usize = 0b11;
@@ -1034,10 +1057,10 @@ mod tests {
         assert_eq!(writer.rows(), 0);
         assert_eq!(writer.max_row_size(), 0);
         assert_eq!(File::open(writer.data_path()).unwrap().metadata().unwrap().len() as usize, 0);
-        // Only the byte that indicates how many bytes per offset should be left
+        // Offset size byte (1) + final offset (8) = 9 bytes
         assert_eq!(
             File::open(writer.offsets_path()).unwrap().metadata().unwrap().len() as usize,
-            1
+            9
         );
         writer.commit().unwrap();
         assert!(!writer.is_dirty());

@@ -12,11 +12,26 @@ description = "tracing helpers"
 workspace = true
 
 [dependencies]
+# reth
+reth-tracing-otlp = { workspace = true, optional = true }
+
+# obs
 tracing.workspace = true
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "json"] }
 tracing-appender.workspace = true
-tracing-journald = "0.3"
-tracing-logfmt = "0.3.3"
-rolling-file = "0.2.0"
-eyre.workspace = true
+tracing-journald.workspace = true
+tracing-logfmt.workspace = true
+tracing-samply.workspace = true
+tracing-tracy = { workspace = true, optional = true }
+tracy-client = { workspace = true, optional = true }
+
+# misc
 clap = { workspace = true, features = ["derive"] }
+eyre.workspace = true
+rolling-file.workspace = true
+
+[features]
+default = ["otlp"]
+otlp = ["reth-tracing-otlp"]
+otlp-logs = ["reth-tracing-otlp/otlp-logs"]
+tracy = ["tracing-tracy", "tracy-client"]

@@ -1,28 +1,22 @@
 //! Utilities for end-to-end tests.
 
-use std::sync::Arc;
-
 use node::NodeTestContext;
-use reth::{
-    args::{DiscoveryArgs, NetworkArgs, RpcServerArgs},
-    builder::{NodeBuilder, NodeConfig, NodeHandle},
-    network::PeersHandleProvider,
-    tasks::TaskManager,
-};
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
+use reth_chainspec::ChainSpec;
 use reth_db::{test_utils::TempDatabase, DatabaseEnv};
-use reth_engine_local::LocalPayloadAttributesBuilder;
+use reth_network_api::test_utils::PeersHandleProvider;
 use reth_node_builder::{
-    components::NodeComponentsBuilder, rpc::RethRpcAddOns, EngineNodeLauncher,
-    FullNodeTypesAdapter, Node, NodeAdapter, NodeComponents, NodeTypesWithDBAdapter,
-    NodeTypesWithEngine, PayloadAttributesBuilder, PayloadTypes,
+    components::NodeComponentsBuilder,
+    rpc::{EngineValidatorAddOn, RethRpcAddOns},
+    FullNodeTypesAdapter, Node, NodeAdapter, NodeComponents, NodeTypes, NodeTypesWithDBAdapter,
+    PayloadTypes,
 };
-use reth_provider::providers::{BlockchainProvider, BlockchainProvider2};
-use tracing::{span, Level};
+use reth_provider::providers::{BlockchainProvider, NodeTypesForProvider};
+use std::sync::Arc;
 use wallet::Wallet;
 
 /// Wrapper type to create test nodes
 pub mod node;
+pub mod testsuite;
 
 /// Helper for transaction operations
 pub mod transaction;
@@ -33,76 +27,36 @@ pub mod wallet;
 /// Helper for payload operations
 mod payload;
 
+/// Helper for setting up nodes with pre-imported chain data
+pub mod setup_import;
+
 /// Helper for network operations
 mod network;
 
-/// Helper for engine api operations
-mod engine_api;
 /// Helper for rpc operations
 mod rpc;
 
-/// Helper traits
-mod traits;
+/// Utilities for creating and writing RLP test data
+pub mod test_rlp_utils;
+
+/// Builder for configuring test node setups
+mod setup_builder;
+pub use setup_builder::E2ETestSetupBuilder;
 
 /// Creates the initial setup with `num_nodes` started and interconnected.
 pub async fn setup<N>(
     num_nodes: usize,
     chain_spec: Arc<N::ChainSpec>,
     is_dev: bool,
-    attributes_generator: impl Fn(u64) -> <<N as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes + Copy + 'static,
-) -> eyre::Result<(Vec<NodeHelperType<N, N::AddOns>>, TaskManager, Wallet)>
+    attributes_generator: impl Fn(u64) -> <<N as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+) -> eyre::Result<(Vec<NodeHelperType<N>>, Wallet)>
 where
-    N: Default + Node<TmpNodeAdapter<N>> + NodeTypesWithEngine<ChainSpec: EthereumHardforks>,
-    N::ComponentsBuilder: NodeComponentsBuilder<
-        TmpNodeAdapter<N>,
-        Components: NodeComponents<TmpNodeAdapter<N>, Network: PeersHandleProvider>,
-    >,
-    N::AddOns: RethRpcAddOns<Adapter<N>>,
+    N: NodeBuilderHelper,
 {
-    let tasks = TaskManager::current();
-    let exec = tasks.executor();
-
-    let network_config = NetworkArgs {
-        discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
-        ..NetworkArgs::default()
-    };
-
-    // Create nodes and peer them
-    let mut nodes: Vec<NodeTestContext<_, _>> = Vec::with_capacity(num_nodes);
-
-    for idx in 0..num_nodes {
-        let node_config = NodeConfig::new(chain_spec.clone())
-            .with_network(network_config.clone())
-            .with_unused_ports()
-            .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
-            .set_dev(is_dev);
-
-        let span = span!(Level::INFO, "node", idx);
-        let _enter = span.enter();
-        let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
-            .testing_node(exec.clone())
-            .node(Default::default())
-            .launch()
-            .await?;
-
-        let mut node = NodeTestContext::new(node, attributes_generator).await?;
-
-        // Connect each node in a chain.
-        if let Some(previous_node) = nodes.last_mut() {
-            previous_node.connect(&mut node).await;
-        }
-
-        // Connect last node with the first if there are more than two
-        if idx + 1 == num_nodes && num_nodes > 2 {
-            if let Some(first_node) = nodes.first_mut() {
-                node.connect(first_node).await;
-            }
-        }
-
-        nodes.push(node);
-    }
-
-    Ok((nodes, tasks, Wallet::default().with_chain_id(chain_spec.chain().into())))
+    E2ETestSetupBuilder::new(num_nodes, chain_spec, attributes_generator)
+        .with_node_config_modifier(move |config| config.set_dev(is_dev))
+        .build()
+        .await
 }
 
 /// Creates the initial setup with `num_nodes` started and interconnected.
@@ -110,89 +64,58 @@ pub async fn setup_engine<N>(
     num_nodes: usize,
     chain_spec: Arc<N::ChainSpec>,
     is_dev: bool,
-    attributes_generator: impl Fn(u64) -> <<N as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadBuilderAttributes + Copy + 'static,
+    tree_config: reth_node_api::TreeConfig,
+    attributes_generator: impl Fn(u64) -> <<N as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
 ) -> eyre::Result<(
-    Vec<NodeHelperType<N, N::AddOns, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>,
-    TaskManager,
+    Vec<NodeHelperType<N, BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>>>,
     Wallet,
 )>
 where
-    N: Default
-        + Node<TmpNodeAdapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>
-        + NodeTypesWithEngine<ChainSpec: EthereumHardforks>,
-    N::ComponentsBuilder: NodeComponentsBuilder<
-        TmpNodeAdapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>,
-        Components: NodeComponents<
-            TmpNodeAdapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>,
-            Network: PeersHandleProvider,
-        >,
-    >,
-    N::AddOns: RethRpcAddOns<Adapter<N, BlockchainProvider2<NodeTypesWithDBAdapter<N, TmpDB>>>>,
-    LocalPayloadAttributesBuilder<N::ChainSpec>: PayloadAttributesBuilder<
-        <<N as NodeTypesWithEngine>::Engine as PayloadTypes>::PayloadAttributes,
-    >,
+    N: NodeBuilderHelper,
 {
-    let tasks = TaskManager::current();
-    let exec = tasks.executor();
+    setup_engine_with_connection::<N>(
+        num_nodes,
+        chain_spec,
+        is_dev,
+        tree_config,
+        attributes_generator,
+        true,
+    )
+    .await
+}
 
-    let network_config = NetworkArgs {
-        discovery: DiscoveryArgs { disable_discovery: true, ..DiscoveryArgs::default() },
-        ..NetworkArgs::default()
-    };
-
-    // Create nodes and peer them
-    let mut nodes: Vec<NodeTestContext<_, _>> = Vec::with_capacity(num_nodes);
-
-    for idx in 0..num_nodes {
-        let node_config = NodeConfig::new(chain_spec.clone())
-            .with_network(network_config.clone())
-            .with_unused_ports()
-            .with_rpc(RpcServerArgs::default().with_unused_ports().with_http())
-            .set_dev(is_dev);
-
-        let span = span!(Level::INFO, "node", idx);
-        let _enter = span.enter();
-        let node = N::default();
-        let NodeHandle { node, node_exit_future: _ } = NodeBuilder::new(node_config.clone())
-            .testing_node(exec.clone())
-            .with_types_and_provider::<N, BlockchainProvider2<_>>()
-            .with_components(node.components_builder())
-            .with_add_ons(node.add_ons())
-            .launch_with_fn(|builder| {
-                let launcher = EngineNodeLauncher::new(
-                    builder.task_executor().clone(),
-                    builder.config().datadir(),
-                    Default::default(),
-                );
-                builder.launch_with(launcher)
-            })
-            .await?;
-
-        let mut node = NodeTestContext::new(node, attributes_generator).await?;
-
-        // Connect each node in a chain.
-        if let Some(previous_node) = nodes.last_mut() {
-            previous_node.connect(&mut node).await;
-        }
-
-        // Connect last node with the first if there are more than two
-        if idx + 1 == num_nodes && num_nodes > 2 {
-            if let Some(first_node) = nodes.first_mut() {
-                node.connect(first_node).await;
-            }
-        }
-
-        nodes.push(node);
-    }
-
-    Ok((nodes, tasks, Wallet::default().with_chain_id(chain_spec.chain().into())))
+/// Creates the initial setup with `num_nodes` started and optionally interconnected.
+pub async fn setup_engine_with_connection<N>(
+    num_nodes: usize,
+    chain_spec: Arc<N::ChainSpec>,
+    is_dev: bool,
+    tree_config: reth_node_api::TreeConfig,
+    attributes_generator: impl Fn(u64) -> <<N as NodeTypes>::Payload as PayloadTypes>::PayloadBuilderAttributes + Send + Sync + Copy + 'static,
+    connect_nodes: bool,
+) -> eyre::Result<(
+    Vec<NodeHelperType<N, BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>>>,
+    Wallet,
+)>
+where
+    N: NodeBuilderHelper,
+{
+    E2ETestSetupBuilder::new(num_nodes, chain_spec, attributes_generator)
+        .with_tree_config_modifier(move |base| {
+            // Apply caller's tree_config but preserve the small cache size from base
+            tree_config.clone().with_cross_block_cache_size(base.cross_block_cache_size())
+        })
+        .with_node_config_modifier(move |config| config.set_dev(is_dev))
+        .with_connect_nodes(connect_nodes)
+        .build()
+        .await
 }
 
 // Type aliases
 
-type TmpDB = Arc<TempDatabase<DatabaseEnv>>;
+/// Testing database
+pub type TmpDB = Arc<TempDatabase<DatabaseEnv>>;
 type TmpNodeAdapter<N, Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>> =
-    FullNodeTypesAdapter<NodeTypesWithDBAdapter<N, TmpDB>, Provider>;
+    FullNodeTypesAdapter<N, TmpDB, Provider>;
 
 /// Type alias for a `NodeAdapter`
 pub type Adapter<N, Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>> = NodeAdapter<
@@ -203,5 +126,57 @@ pub type Adapter<N, Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, TmpD
 >;
 
 /// Type alias for a type of `NodeHelper`
-pub type NodeHelperType<N, AO, Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>> =
-    NodeTestContext<Adapter<N, Provider>, AO>;
+pub type NodeHelperType<N, Provider = BlockchainProvider<NodeTypesWithDBAdapter<N, TmpDB>>> =
+    NodeTestContext<Adapter<N, Provider>, <N as Node<TmpNodeAdapter<N, Provider>>>::AddOns>;
+
+/// Helper trait to simplify bounds when calling setup functions.
+pub trait NodeBuilderHelper
+where
+    Self: Default
+        + NodeTypesForProvider<
+            Payload: PayloadTypes<
+                PayloadBuilderAttributes: From<reth_payload_builder::EthPayloadBuilderAttributes>,
+            >,
+        > + Node<
+            TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            ComponentsBuilder: NodeComponentsBuilder<
+                TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+                Components: NodeComponents<
+                    TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+                    Network: PeersHandleProvider,
+                >,
+            >,
+            AddOns: RethRpcAddOns<
+                Adapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            > + EngineValidatorAddOn<
+                Adapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            >,
+            ChainSpec: From<ChainSpec> + Clone,
+        >,
+{
+}
+
+impl<T> NodeBuilderHelper for T where
+    Self: Default
+        + NodeTypesForProvider<
+            Payload: PayloadTypes<
+                PayloadBuilderAttributes: From<reth_payload_builder::EthPayloadBuilderAttributes>,
+            >,
+        > + Node<
+            TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            ComponentsBuilder: NodeComponentsBuilder<
+                TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+                Components: NodeComponents<
+                    TmpNodeAdapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+                    Network: PeersHandleProvider,
+                >,
+            >,
+            AddOns: RethRpcAddOns<
+                Adapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            > + EngineValidatorAddOn<
+                Adapter<Self, BlockchainProvider<NodeTypesWithDBAdapter<Self, TmpDB>>>,
+            >,
+            ChainSpec: From<ChainSpec> + Clone,
+        >
+{
+}

@@ -122,10 +122,10 @@ impl TreeRootEntry {
         Ok(Self { enr_root, link_root, sequence_number, signature })
     }
 
-    /// Returns the _unsigned_ content pairs of the entry:
+    /// Returns the _unsigned_ content of the entry used for signing:
     ///
     /// ```text
-    /// e=<enr-root> l=<link-root> seq=<sequence-number> sig=<signature>
+    /// enrtree-root:v1 e=<enr-root> l=<link-root> seq=<sequence-number>
     /// ```
     fn content(&self) -> String {
         format!(
@@ -203,7 +203,7 @@ impl BranchEntry {
                 n * 5 / 8
             }
 
-            let decoded_len = base32_no_padding_decoded_len(hash.bytes().len());
+            let decoded_len = base32_no_padding_decoded_len(hash.len());
             if !(12..=32).contains(&decoded_len) || hash.chars().any(|c| c.is_whitespace()) {
                 return Err(ParseDnsEntryError::InvalidChildHash(hash.to_string()))
             }

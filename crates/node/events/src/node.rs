@@ -1,19 +1,19 @@
 //! Support for handling events emitted by node components.
 
 use crate::cl::ConsensusLayerHealthEvent;
-use alloy_consensus::constants::GWEI_TO_WEI;
+use alloy_consensus::{
+    constants::{GWEI_TO_WEI, MGAS_TO_GAS},
+    BlockHeader,
+};
 use alloy_primitives::{BlockNumber, B256};
 use alloy_rpc_types_engine::ForkchoiceState;
 use futures::Stream;
-use reth_beacon_consensus::{
-    BeaconConsensusEngineEvent, ConsensusEngineLiveSyncProgress, ForkchoiceStatus,
-};
-use reth_network::NetworkEvent;
+use reth_engine_primitives::{ConsensusEngineEvent, ForkchoiceStatus, SlowBlockInfo};
 use reth_network_api::PeersInfo;
-use reth_primitives_traits::{format_gas, format_gas_throughput};
-use reth_prune::PrunerEvent;
+use reth_primitives_traits::{format_gas, format_gas_throughput, BlockBody, NodePrimitives};
+use reth_prune_types::PrunerEvent;
 use reth_stages::{EntitiesCheckpoint, ExecOutput, PipelineEvent, StageCheckpoint, StageId};
-use reth_static_file::StaticFileProducerEvent;
+use reth_static_file_types::StaticFileProducerEvent;
 use std::{
     fmt::{Display, Formatter},
     future::Future,
@@ -38,14 +38,14 @@ struct NodeState {
     current_stage: Option<CurrentStage>,
     /// The latest block reached by either pipeline or consensus engine.
     latest_block: Option<BlockNumber>,
-    /// The time of the latest block seen by the pipeline
-    latest_block_time: Option<u64>,
     /// Hash of the head block last set by fork choice update
     head_block_hash: Option<B256>,
     /// Hash of the safe block last set by fork choice update
     safe_block_hash: Option<B256>,
     /// Hash of finalized block last set by fork choice update
     finalized_block_hash: Option<B256>,
+    /// The time when we last logged a status message
+    last_status_log_time: Option<u64>,
 }
 
 impl NodeState {
@@ -57,10 +57,10 @@ impl NodeState {
             peers_info,
             current_stage: None,
             latest_block,
-            latest_block_time: None,
             head_block_hash: None,
             safe_block_hash: None,
             finalized_block_hash: None,
+            last_status_log_time: None,
         }
     }
 
@@ -209,19 +209,17 @@ impl NodeState {
 
                 self.current_stage = Some(current_stage);
             }
+            PipelineEvent::Unwound { stage_id, result } => {
+                info!(stage = %stage_id, checkpoint = %result.checkpoint.block_number, "Unwound stage");
+                self.current_stage = None;
+            }
             _ => (),
         }
     }
 
-    fn handle_network_event(&self, _: NetworkEvent) {
-        // NOTE(onbjerg): This used to log established/disconnecting sessions, but this is already
-        // logged in the networking component. I kept this stub in case we want to catch other
-        // networking events later on.
-    }
-
-    fn handle_consensus_engine_event(&mut self, event: BeaconConsensusEngineEvent) {
+    fn handle_consensus_engine_event<N: NodePrimitives>(&mut self, event: ConsensusEngineEvent<N>) {
         match event {
-            BeaconConsensusEngineEvent::ForkchoiceUpdated(state, status) => {
+            ConsensusEngineEvent::ForkchoiceUpdated(state, status) => {
                 let ForkchoiceState { head_block_hash, safe_block_hash, finalized_block_hash } =
                     state;
                 if self.safe_block_hash != Some(safe_block_hash) &&
@@ -240,46 +238,102 @@ impl NodeState {
                 self.safe_block_hash = Some(safe_block_hash);
                 self.finalized_block_hash = Some(finalized_block_hash);
             }
-            BeaconConsensusEngineEvent::LiveSyncProgress(live_sync_progress) => {
-                match live_sync_progress {
-                    ConsensusEngineLiveSyncProgress::DownloadingBlocks {
-                        remaining_blocks,
-                        target,
-                    } => {
-                        info!(
-                            remaining_blocks,
-                            target_block_hash=?target,
-                            "Live sync in progress, downloading blocks"
-                        );
-                    }
+            ConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed) => {
+                let block = executed.sealed_block();
+                let mut full = block.gas_used() as f64 * 100.0 / block.gas_limit() as f64;
+                if full.is_nan() {
+                    full = 0.0;
                 }
-            }
-            BeaconConsensusEngineEvent::CanonicalBlockAdded(block, elapsed) => {
                 info!(
-                    number=block.number,
+                    number=block.number(),
                     hash=?block.hash(),
                     peers=self.num_connected_peers(),
-                    txs=block.body.transactions.len(),
-                    gas=%format_gas(block.header.gas_used),
-                    gas_throughput=%format_gas_throughput(block.header.gas_used, elapsed),
-                    full=%format!("{:.1}%", block.header.gas_used as f64 * 100.0 / block.header.gas_limit as f64),
-                    base_fee=%format!("{:.2}gwei", block.header.base_fee_per_gas.unwrap_or(0) as f64 / GWEI_TO_WEI as f64),
-                    blobs=block.header.blob_gas_used.unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
-                    excess_blobs=block.header.excess_blob_gas.unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
+                    txs=block.body().transactions().len(),
+                    gas_used=%format_gas(block.gas_used()),
+                    gas_throughput=%format_gas_throughput(block.gas_used(), elapsed),
+                    gas_limit=%format_gas(block.gas_limit()),
+                    full=%format!("{:.1}%", full),
+                    base_fee=%format!("{:.2}Gwei", block.base_fee_per_gas().unwrap_or(0) as f64 / GWEI_TO_WEI as f64),
+                    blobs=block.blob_gas_used().unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
+                    excess_blobs=block.excess_blob_gas().unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
                     ?elapsed,
                     "Block added to canonical chain"
                 );
             }
-            BeaconConsensusEngineEvent::CanonicalChainCommitted(head, elapsed) => {
-                self.latest_block = Some(head.number);
-                self.latest_block_time = Some(head.timestamp);
-
-                info!(number=head.number, hash=?head.hash(), ?elapsed, "Canonical chain committed");
+            ConsensusEngineEvent::CanonicalChainCommitted(head, elapsed) => {
+                self.latest_block = Some(head.number());
+                info!(number=head.number(), hash=?head.hash(), ?elapsed, "Canonical chain committed");
             }
-            BeaconConsensusEngineEvent::ForkBlockAdded(block, elapsed) => {
-                info!(number=block.number, hash=?block.hash(), ?elapsed, "Block added to fork chain");
+            ConsensusEngineEvent::ForkBlockAdded(executed, elapsed) => {
+                let block = executed.sealed_block();
+                info!(number=block.number(), hash=?block.hash(), ?elapsed, "Block added to fork chain");
+            }
+            ConsensusEngineEvent::InvalidBlock(block) => {
+                warn!(number=block.number(), hash=?block.hash(), "Encountered invalid block");
+            }
+            ConsensusEngineEvent::BlockReceived(num_hash) => {
+                info!(number=num_hash.number, hash=?num_hash.hash, "Received new payload from consensus engine");
+            }
+            ConsensusEngineEvent::SlowBlock(info) => {
+                Self::log_slow_block(&info);
             }
         }
+    }
+
+    fn log_slow_block(info: &SlowBlockInfo) {
+        fn hit_rate(hits: usize, misses: usize) -> f64 {
+            let total = hits + misses;
+            if total > 0 {
+                (hits as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            }
+        }
+
+        let stats = &info.stats;
+        let processing_secs =
+            stats.execution_duration.as_secs_f64() + stats.state_hash_duration.as_secs_f64();
+        let mgas_per_sec = if processing_secs > 0.0 {
+            (stats.gas_used as f64 / MGAS_TO_GAS as f64) / processing_secs
+        } else {
+            0.0
+        };
+
+        warn!(
+            target: "reth::slow_block",
+            message = "Slow block",
+            block.number = stats.block_number,
+            block.hash = ?stats.block_hash,
+            block.gas_used = stats.gas_used,
+            block.tx_count = stats.tx_count,
+            timing.execution_ms = stats.execution_duration.as_millis(),
+            timing.state_read_ms = stats.state_read_duration.as_millis(),
+            timing.state_hash_ms = stats.state_hash_duration.as_millis(),
+            timing.commit_ms = info.commit_duration.as_millis(),
+            timing.total_ms = info.total_duration.as_millis(),
+            throughput.mgas_per_sec = format!("{:.2}", mgas_per_sec),
+            state_reads.accounts = stats.accounts_read,
+            state_reads.storage_slots = stats.storage_read,
+            state_reads.code = stats.code_read,
+            state_reads.code_bytes = stats.code_bytes_read,
+            state_writes.accounts = stats.accounts_changed,
+            state_writes.accounts_deleted = stats.accounts_deleted,
+            state_writes.storage_slots = stats.storage_slots_changed,
+            state_writes.storage_slots_deleted = stats.storage_slots_deleted,
+            state_writes.code = stats.bytecodes_changed,
+            state_writes.code_bytes = stats.code_bytes_written,
+            state_writes.eip7702_delegations_set = stats.eip7702_delegations_set,
+            state_writes.eip7702_delegations_cleared = stats.eip7702_delegations_cleared,
+            cache.account.hits = stats.account_cache_hits,
+            cache.account.misses = stats.account_cache_misses,
+            cache.account.hit_rate = format!("{:.2}", hit_rate(stats.account_cache_hits, stats.account_cache_misses)),
+            cache.storage.hits = stats.storage_cache_hits,
+            cache.storage.misses = stats.storage_cache_misses,
+            cache.storage.hit_rate = format!("{:.2}", hit_rate(stats.storage_cache_hits, stats.storage_cache_misses)),
+            cache.code.hits = stats.code_cache_hits,
+            cache.code.misses = stats.code_cache_misses,
+            cache.code.hit_rate = format!("{:.2}", hit_rate(stats.code_cache_hits, stats.code_cache_misses)),
+        );
     }
 
     fn handle_consensus_layer_health_event(&self, event: ConsensusLayerHealthEvent) {
@@ -288,16 +342,15 @@ impl NodeState {
         if self.current_stage.is_none() {
             match event {
                 ConsensusLayerHealthEvent::NeverSeen => {
-                    warn!("Post-merge network, but never seen beacon client. Please launch one to follow the chain!")
-                }
-                ConsensusLayerHealthEvent::HasNotBeenSeenForAWhile(period) => {
-                    warn!(?period, "Post-merge network, but no beacon client seen for a while. Please launch one to follow the chain!")
-                }
-                ConsensusLayerHealthEvent::NeverReceivedUpdates => {
-                    warn!("Beacon client online, but never received consensus updates. Please ensure your beacon client is operational to follow the chain!")
+                    warn!(
+                        "Post-merge network, but never seen beacon client. Please launch one to follow the chain!"
+                    )
                 }
                 ConsensusLayerHealthEvent::HaveNotReceivedUpdatesForAWhile(period) => {
-                    warn!(?period, "Beacon client online, but no consensus updates received for a while. This may be because of a reth error, or an error in the beacon client! Please investigate reth and beacon client logs!")
+                    warn!(
+                        ?period,
+                        "Beacon client online, but no consensus updates received for a while. This may be because of a reth error, or an error in the beacon client! Please investigate reth and beacon client logs!"
+                    )
                 }
             }
         }
@@ -306,10 +359,14 @@ impl NodeState {
     fn handle_pruner_event(&self, event: PrunerEvent) {
         match event {
             PrunerEvent::Started { tip_block_number } => {
-                info!(tip_block_number, "Pruner started");
+                debug!(tip_block_number, "Pruner started");
             }
             PrunerEvent::Finished { tip_block_number, elapsed, stats } => {
-                info!(tip_block_number, ?elapsed, ?stats, "Pruner finished");
+                let stats = format!(
+                    "[{}]",
+                    stats.iter().map(|item| item.to_string()).collect::<Vec<_>>().join(", ")
+                );
+                debug!(tip_block_number, ?elapsed, pruned_segments = %stats, "Pruner finished");
             }
         }
     }
@@ -317,10 +374,10 @@ impl NodeState {
     fn handle_static_file_producer_event(&self, event: StaticFileProducerEvent) {
         match event {
             StaticFileProducerEvent::Started { targets } => {
-                info!(?targets, "Static File Producer started");
+                debug!(?targets, "Static File Producer started");
             }
             StaticFileProducerEvent::Finished { targets, elapsed } => {
-                info!(?targets, ?elapsed, "Static File Producer finished");
+                debug!(?targets, ?elapsed, "Static File Producer finished");
             }
         }
     }
@@ -354,14 +411,12 @@ struct CurrentStage {
 }
 
 /// A node event.
-#[derive(Debug)]
-pub enum NodeEvent {
-    /// A network event.
-    Network(NetworkEvent),
+#[derive(Debug, derive_more::From)]
+pub enum NodeEvent<N: NodePrimitives> {
     /// A sync pipeline event.
     Pipeline(PipelineEvent),
     /// A consensus engine event.
-    ConsensusEngine(BeaconConsensusEngineEvent),
+    ConsensusEngine(ConsensusEngineEvent<N>),
     /// A Consensus Layer health event.
     ConsensusLayerHealth(ConsensusLayerHealthEvent),
     /// A pruner event
@@ -373,50 +428,14 @@ pub enum NodeEvent {
     Other(String),
 }
 
-impl From<NetworkEvent> for NodeEvent {
-    fn from(event: NetworkEvent) -> Self {
-        Self::Network(event)
-    }
-}
-
-impl From<PipelineEvent> for NodeEvent {
-    fn from(event: PipelineEvent) -> Self {
-        Self::Pipeline(event)
-    }
-}
-
-impl From<BeaconConsensusEngineEvent> for NodeEvent {
-    fn from(event: BeaconConsensusEngineEvent) -> Self {
-        Self::ConsensusEngine(event)
-    }
-}
-
-impl From<ConsensusLayerHealthEvent> for NodeEvent {
-    fn from(event: ConsensusLayerHealthEvent) -> Self {
-        Self::ConsensusLayerHealth(event)
-    }
-}
-
-impl From<PrunerEvent> for NodeEvent {
-    fn from(event: PrunerEvent) -> Self {
-        Self::Pruner(event)
-    }
-}
-
-impl From<StaticFileProducerEvent> for NodeEvent {
-    fn from(event: StaticFileProducerEvent) -> Self {
-        Self::StaticFileProducer(event)
-    }
-}
-
 /// Displays relevant information to the user from components of the node, and periodically
 /// displays the high-level status of the node.
-pub async fn handle_events<E>(
+pub async fn handle_events<E, N: NodePrimitives>(
     peers_info: Option<Box<dyn PeersInfo>>,
     latest_block_number: Option<BlockNumber>,
     events: E,
 ) where
-    E: Stream<Item = NodeEvent> + Unpin,
+    E: Stream<Item = NodeEvent<N>> + Unpin,
 {
     let state = NodeState::new(peers_info, latest_block_number);
 
@@ -438,9 +457,9 @@ struct EventHandler<E> {
     info_interval: Interval,
 }
 
-impl<E> Future for EventHandler<E>
+impl<E, N: NodePrimitives> Future for EventHandler<E>
 where
-    E: Stream<Item = NodeEvent> + Unpin,
+    E: Stream<Item = NodeEvent<N>> + Unpin,
 {
     type Output = ();
 
@@ -501,33 +520,33 @@ where
                         )
                     }
                 }
-            } else if let Some(latest_block) = this.state.latest_block {
+            } else {
                 let now =
                     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                if now.saturating_sub(this.state.latest_block_time.unwrap_or(0)) > 60 {
-                    // Once we start receiving consensus nodes, don't emit status unless stalled for
-                    // 1 minute
-                    info!(
-                        target: "reth::cli",
-                        connected_peers = this.state.num_connected_peers(),
-                        %latest_block,
-                        "Status"
-                    );
+
+                // Only log status if we haven't logged recently
+                if now.saturating_sub(this.state.last_status_log_time.unwrap_or(0)) > 60 {
+                    if let Some(latest_block) = this.state.latest_block {
+                        info!(
+                            target: "reth::cli",
+                            connected_peers = this.state.num_connected_peers(),
+                            %latest_block,
+                            "Status"
+                        );
+                    } else {
+                        info!(
+                            target: "reth::cli",
+                            connected_peers = this.state.num_connected_peers(),
+                            "Status"
+                        );
+                    }
+                    this.state.last_status_log_time = Some(now);
                 }
-            } else {
-                info!(
-                    target: "reth::cli",
-                    connected_peers = this.state.num_connected_peers(),
-                    "Status"
-                );
             }
         }
 
         while let Poll::Ready(Some(event)) = this.events.as_mut().poll_next(cx) {
             match event {
-                NodeEvent::Network(event) => {
-                    this.state.handle_network_event(event);
-                }
                 NodeEvent::Pipeline(event) => {
                     this.state.handle_pipeline_event(event);
                 }
@@ -627,6 +646,8 @@ impl Display for Eta {
                     f,
                     "{}",
                     humantime::format_duration(Duration::from_secs(remaining.as_secs()))
+                        .to_string()
+                        .replace(' ', "")
                 )
             }
         }
@@ -652,6 +673,6 @@ mod tests {
         }
         .to_string();
 
-        assert_eq!(eta, "13m 37s");
+        assert_eq!(eta, "13m37s");
     }
 }

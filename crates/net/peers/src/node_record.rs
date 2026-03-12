@@ -1,21 +1,24 @@
 //! Commonly used `NodeRecord` type for peers.
 
-use std::{
+use crate::PeerId;
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+use alloy_rlp::{RlpDecodable, RlpEncodable};
+use core::{
     fmt,
     fmt::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::ParseIntError,
     str::FromStr,
 };
-
-use crate::PeerId;
-use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 #[cfg(feature = "secp256k1")]
 use enr::Enr;
 
-/// Represents a ENR in discovery.
+/// Represents an ENR in discovery.
 ///
 /// Note: this is only an excerpt of the [`NodeRecord`] data structure.
 #[derive(
@@ -60,11 +63,11 @@ impl NodeRecord {
     /// See also [`std::net::Ipv6Addr::to_ipv4_mapped`]
     pub fn convert_ipv4_mapped(&mut self) -> bool {
         // convert IPv4 mapped IPv6 address
-        if let IpAddr::V6(v6) = self.address {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                self.address = v4.into();
-                return true
-            }
+        if let IpAddr::V6(v6) = self.address &&
+            let Some(v4) = v6.to_ipv4_mapped()
+        {
+            self.address = v4.into();
+            return true
         }
         false
     }
@@ -231,24 +234,23 @@ impl TryFrom<&Enr<secp256k1::SecretKey>> for NodeRecord {
 
 #[cfg(test)]
 mod tests {
-    use alloy_rlp::Decodable;
-    use rand::{thread_rng, Rng, RngCore};
-    use std::net::Ipv6Addr;
-
     use super::*;
+    use alloy_rlp::Decodable;
+    use rand::{rng, Rng, RngCore};
+    use std::net::Ipv6Addr;
 
     #[test]
     fn test_mapped_ipv6() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
 
         let v4: Ipv4Addr = "0.0.0.0".parse().unwrap();
         let v6 = v4.to_ipv6_mapped();
 
         let record = NodeRecord {
             address: v6.into(),
-            tcp_port: rng.gen(),
-            udp_port: rng.gen(),
-            id: rng.gen(),
+            tcp_port: rng.random(),
+            udp_port: rng.random(),
+            id: rng.random(),
         };
 
         assert!(record.clone().convert_ipv4_mapped());
@@ -257,14 +259,14 @@ mod tests {
 
     #[test]
     fn test_mapped_ipv4() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let v4: Ipv4Addr = "0.0.0.0".parse().unwrap();
 
         let record = NodeRecord {
             address: v4.into(),
-            tcp_port: rng.gen(),
-            udp_port: rng.gen(),
-            id: rng.gen(),
+            tcp_port: rng.random(),
+            udp_port: rng.random(),
+            id: rng.random(),
         };
 
         assert!(!record.clone().convert_ipv4_mapped());
@@ -273,15 +275,15 @@ mod tests {
 
     #[test]
     fn test_noderecord_codec_ipv4() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         for _ in 0..100 {
             let mut ip = [0u8; 4];
             rng.fill_bytes(&mut ip);
             let record = NodeRecord {
                 address: IpAddr::V4(ip.into()),
-                tcp_port: rng.gen(),
-                udp_port: rng.gen(),
-                id: rng.gen(),
+                tcp_port: rng.random(),
+                udp_port: rng.random(),
+                id: rng.random(),
             };
 
             let decoded = NodeRecord::decode(&mut alloy_rlp::encode(record).as_slice()).unwrap();
@@ -291,20 +293,32 @@ mod tests {
 
     #[test]
     fn test_noderecord_codec_ipv6() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         for _ in 0..100 {
             let mut ip = [0u8; 16];
             rng.fill_bytes(&mut ip);
             let record = NodeRecord {
                 address: IpAddr::V6(ip.into()),
-                tcp_port: rng.gen(),
-                udp_port: rng.gen(),
-                id: rng.gen(),
+                tcp_port: rng.random(),
+                udp_port: rng.random(),
+                id: rng.random(),
             };
 
             let decoded = NodeRecord::decode(&mut alloy_rlp::encode(record).as_slice()).unwrap();
             assert_eq!(record, decoded);
         }
+    }
+
+    #[test]
+    fn test_node_record() {
+        let url = "enode://fc8a2ff614e848c0af4c99372a81b8655edb8e11b617cffd0aab1a0691bcca66ca533626a528ee567f05f70c8cb529bda2c0a864cc0aec638a367fd2bb8e49fb@127.0.0.1:35481?discport=0";
+        let node: NodeRecord = url.parse().unwrap();
+        assert_eq!(node, NodeRecord {
+            address: IpAddr::V4([127,0,0, 1].into()),
+            tcp_port: 35481,
+            udp_port: 0,
+            id: "0xfc8a2ff614e848c0af4c99372a81b8655edb8e11b617cffd0aab1a0691bcca66ca533626a528ee567f05f70c8cb529bda2c0a864cc0aec638a367fd2bb8e49fb".parse().unwrap(),
+        })
     }
 
     #[test]

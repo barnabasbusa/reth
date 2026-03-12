@@ -1,13 +1,12 @@
 use crate::TrieMask;
+use alloc::vec::Vec;
 use alloy_trie::{hash_builder::HashBuilderValue, nodes::RlpNode, HashBuilder};
-use bytes::Buf;
 use nybbles::Nibbles;
-use reth_codecs::Compact;
-use serde::{Deserialize, Serialize};
 
 /// The hash builder state for storing in the database.
 /// Check the `reth-trie` crate for more info on hash builder.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(any(test, feature = "serde"), derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "arbitrary",
     derive(arbitrary::Arbitrary),
@@ -38,7 +37,7 @@ impl From<HashBuilderState> for HashBuilder {
             key: Nibbles::from_nibbles_unchecked(state.key),
             stack: state.stack,
             value: state.value,
-            groups: state.groups,
+            state_masks: state.groups,
             tree_masks: state.tree_masks,
             hash_masks: state.hash_masks,
             stored_in_database: state.stored_in_database,
@@ -52,10 +51,10 @@ impl From<HashBuilderState> for HashBuilder {
 impl From<HashBuilder> for HashBuilderState {
     fn from(state: HashBuilder) -> Self {
         Self {
-            key: state.key.into(),
+            key: state.key.to_vec(),
             stack: state.stack,
             value: state.value,
-            groups: state.groups,
+            groups: state.state_masks,
             tree_masks: state.tree_masks,
             hash_masks: state.hash_masks,
             stored_in_database: state.stored_in_database,
@@ -63,7 +62,8 @@ impl From<HashBuilder> for HashBuilderState {
     }
 }
 
-impl Compact for HashBuilderState {
+#[cfg(any(test, feature = "reth-codec"))]
+impl reth_codecs::Compact for HashBuilderState {
     fn to_compact<B>(&self, buf: &mut B) -> usize
     where
         B: bytes::BufMut + AsMut<[u8]>,
@@ -106,6 +106,8 @@ impl Compact for HashBuilderState {
     }
 
     fn from_compact(buf: &[u8], _len: usize) -> (Self, &[u8]) {
+        use bytes::Buf;
+
         let (key, mut buf) = Vec::from_compact(buf, 0);
 
         let stack_len = buf.get_u16() as usize;
@@ -150,6 +152,7 @@ impl Compact for HashBuilderState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reth_codecs::Compact;
 
     #[test]
     fn hash_builder_state_regression() {

@@ -1,22 +1,23 @@
-//! Example for how hook into the node via the CLI extension mechanism without registering
+//! Example for how to hook into the node via the CLI extension mechanism without registering
 //! additional arguments
 //!
 //! Run with
 //!
-//! ```not_rust
+//! ```sh
 //! cargo run -p node-event-hooks -- node
 //! ```
 //!
-//! This launch the regular reth node and also print:
+//! This launches a regular reth node and also print:
 //! > "All components initialized" – once all components have been initialized
 //! > "Node started" – once the node has been started.
 
-use reth::cli::Cli;
-use reth_node_ethereum::EthereumNode;
+#![warn(unused_crate_dependencies)]
+
+use reth_ethereum::{cli::interface::Cli, node::EthereumNode};
 
 fn main() {
     Cli::parse_args()
-        .run(|builder, _| async move {
+        .run(async move |builder, _| {
             let handle = builder
                 .node(EthereumNode::default())
                 .on_node_started(|_ctx| {

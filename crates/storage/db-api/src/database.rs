@@ -3,7 +3,7 @@ use crate::{
     transaction::{DbTx, DbTxMut},
     DatabaseError,
 };
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
 /// Main Database trait that can open read-only and read-write transactions.
 ///
@@ -22,15 +22,18 @@ pub trait Database: Send + Sync + Debug {
     #[track_caller]
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError>;
 
+    /// Returns the path to the database directory.
+    fn path(&self) -> PathBuf;
+
     /// Takes a function and passes a read-only transaction into it, making sure it's closed in the
     /// end of the execution.
     fn view<T, F>(&self, f: F) -> Result<T, DatabaseError>
     where
-        F: FnOnce(&Self::TX) -> T,
+        F: FnOnce(&mut Self::TX) -> T,
     {
-        let tx = self.tx()?;
+        let mut tx = self.tx()?;
 
-        let res = f(&tx);
+        let res = f(&mut tx);
         tx.commit()?;
 
         Ok(res)
@@ -62,6 +65,10 @@ impl<DB: Database> Database for Arc<DB> {
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
         <DB as Database>::tx_mut(self)
     }
+
+    fn path(&self) -> PathBuf {
+        <DB as Database>::path(self)
+    }
 }
 
 impl<DB: Database> Database for &DB {
@@ -74,5 +81,9 @@ impl<DB: Database> Database for &DB {
 
     fn tx_mut(&self) -> Result<Self::TXMut, DatabaseError> {
         <DB as Database>::tx_mut(self)
+    }
+
+    fn path(&self) -> PathBuf {
+        <DB as Database>::path(self)
     }
 }

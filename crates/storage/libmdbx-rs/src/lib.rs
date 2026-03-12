@@ -6,7 +6,8 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![allow(missing_docs, clippy::needless_pass_by_ref_mut)]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![allow(clippy::borrow_as_ptr)]
 
 pub extern crate reth_mdbx_sys as ffi;
 
@@ -34,6 +35,7 @@ mod error;
 mod flags;
 mod transaction;
 mod txn_manager;
+mod txn_pool;
 
 #[cfg(test)]
 mod test_utils {
@@ -42,7 +44,7 @@ mod test_utils {
     use tempfile::tempdir;
 
     /// Regression test for <https://github.com/danburkert/lmdb-rs/issues/21>.
-    /// This test reliably segfaults when run against lmbdb compiled with opt level -O3 and newer
+    /// This test reliably segfaults when run against lmdb compiled with opt level -O3 and newer
     /// GCC compilers.
     #[test]
     fn issue_21_regression() {

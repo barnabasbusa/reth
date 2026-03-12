@@ -3,13 +3,16 @@
 use crate::dirs::{LogsDir, PlatformPath};
 use clap::{ArgAction, Args, ValueEnum};
 use reth_tracing::{
-    tracing_subscriber::filter::Directive, FileInfo, FileWorkerGuard, LayerInfo, LogFormat,
+    tracing_subscriber::filter::Directive, FileInfo, FileWorkerGuard, LayerInfo, Layers, LogFormat,
     RethTracer, Tracer,
 };
 use std::{fmt, fmt::Display};
 use tracing::{level_filters::LevelFilter, Level};
+
 /// Constant to convert megabytes to bytes
 const MB_TO_BYTES: u64 = 1024 * 1024;
+
+const PROFILER_TRACING_FILTER: &str = "debug";
 
 /// The log configuration.
 #[derive(Debug, Args)]
@@ -35,14 +38,20 @@ pub struct LogArgs {
     #[arg(long = "log.file.directory", value_name = "PATH", global = true, default_value_t)]
     pub log_file_directory: PlatformPath<LogsDir>,
 
+    /// The prefix name of the log files.
+    #[arg(long = "log.file.name", value_name = "NAME", global = true, default_value = "reth.log")]
+    pub log_file_name: String,
+
     /// The maximum size (in MB) of one log file.
     #[arg(long = "log.file.max-size", value_name = "SIZE", global = true, default_value_t = 200)]
     pub log_file_max_size: u64,
 
     /// The maximum amount of log files that will be stored. If set to 0, background file logging
     /// is disabled.
-    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true, default_value_t = 5)]
-    pub log_file_max_files: usize,
+    ///
+    /// Default: 5 for `node` command, 0 for non-node utility subcommands.
+    #[arg(long = "log.file.max-files", value_name = "COUNT", global = true)]
+    pub log_file_max_files: Option<usize>,
 
     /// Write logs to journald.
     #[arg(long = "log.journald", global = true)]
@@ -57,6 +66,34 @@ pub struct LogArgs {
     )]
     pub journald_filter: String,
 
+    /// Emit traces to samply. Only useful when profiling.
+    #[arg(long = "log.samply", global = true, hide = true)]
+    pub samply: bool,
+
+    /// The filter to use for traces emitted to samply.
+    #[arg(
+        long = "log.samply.filter",
+        value_name = "FILTER",
+        global = true,
+        default_value = PROFILER_TRACING_FILTER,
+        hide = true
+    )]
+    pub samply_filter: String,
+
+    /// Emit traces to tracy. Only useful when profiling.
+    #[arg(long = "log.tracy", global = true, hide = true)]
+    pub tracy: bool,
+
+    /// The filter to use for traces emitted to tracy.
+    #[arg(
+        long = "log.tracy.filter",
+        value_name = "FILTER",
+        global = true,
+        default_value = PROFILER_TRACING_FILTER,
+        hide = true
+    )]
+    pub tracy_filter: String,
+
     /// Sets whether or not the formatter emits ANSI terminal escape codes for colors and other
     /// text formatting.
     #[arg(
@@ -66,14 +103,37 @@ pub struct LogArgs {
         default_value_t = ColorMode::Always
     )]
     pub color: ColorMode,
+
     /// The verbosity settings for the tracer.
     #[command(flatten)]
     pub verbosity: Verbosity,
 }
 
 impl LogArgs {
+    /// The default number of log files for the `node` subcommand.
+    pub const DEFAULT_MAX_LOG_FILES_NODE: usize = 5;
+
+    /// Returns the effective maximum number of log files.
+    ///
+    /// If `log_file_max_files` was explicitly set, returns that value.
+    /// Otherwise returns 0 (file logging disabled).
+    ///
+    /// Note: Callers should apply the node-specific default (5) before calling
+    /// `init_tracing` if the command is the `node` subcommand.
+    pub fn effective_log_file_max_files(&self) -> usize {
+        self.log_file_max_files.unwrap_or(0)
+    }
+
+    /// Applies the default `log_file_max_files` value for the `node` subcommand
+    /// if not explicitly set by the user.
+    pub const fn apply_node_defaults(&mut self) {
+        if self.log_file_max_files.is_none() {
+            self.log_file_max_files = Some(Self::DEFAULT_MAX_LOG_FILES_NODE);
+        }
+    }
+
     /// Creates a [`LayerInfo`] instance.
-    fn layer(&self, format: LogFormat, filter: String, use_color: bool) -> LayerInfo {
+    fn layer_info(&self, format: LogFormat, filter: String, use_color: bool) -> LayerInfo {
         LayerInfo::new(
             format,
             self.verbosity.directive().to_string(),
@@ -86,32 +146,67 @@ impl LogArgs {
     fn file_info(&self) -> FileInfo {
         FileInfo::new(
             self.log_file_directory.clone().into(),
+            self.log_file_name.clone(),
             self.log_file_max_size * MB_TO_BYTES,
-            self.log_file_max_files,
+            self.effective_log_file_max_files(),
         )
     }
 
     /// Initializes tracing with the configured options from cli args.
     ///
-    /// Returns the file worker guard, and the file name, if a file worker was configured.
+    /// Returns the file worker guard if a file worker was configured.
     pub fn init_tracing(&self) -> eyre::Result<Option<FileWorkerGuard>> {
+        self.init_tracing_with_layers(Layers::new(), false)
+    }
+
+    /// Initializes tracing with the configured options from cli args.
+    ///
+    /// When `enable_reload` is true, a global log handle is installed that allows changing
+    /// log levels at runtime via RPC methods like `debug_verbosity` and `debug_vmodule`.
+    ///
+    /// # Arguments
+    /// * `layers` - Pre-configured layers to include
+    /// * `enable_reload` - If true, enables runtime log level changes
+    ///
+    /// Returns the file worker guard if a file worker was configured.
+    pub fn init_tracing_with_layers(
+        &self,
+        layers: Layers,
+        enable_reload: bool,
+    ) -> eyre::Result<Option<FileWorkerGuard>> {
         let mut tracer = RethTracer::new();
 
-        let stdout = self.layer(self.log_stdout_format, self.log_stdout_filter.clone(), true);
+        let stdout = self.layer_info(self.log_stdout_format, self.log_stdout_filter.clone(), true);
         tracer = tracer.with_stdout(stdout);
 
         if self.journald {
             tracer = tracer.with_journald(self.journald_filter.clone());
         }
 
-        if self.log_file_max_files > 0 {
+        if self.effective_log_file_max_files() > 0 {
             let info = self.file_info();
-            let file = self.layer(self.log_file_format, self.log_file_filter.clone(), false);
+            let file = self.layer_info(self.log_file_format, self.log_file_filter.clone(), false);
             tracer = tracer.with_file(file, info);
         }
 
-        let guard = tracer.init()?;
-        Ok(guard)
+        if self.samply {
+            let config = self.layer_info(LogFormat::Terminal, self.samply_filter.clone(), false);
+            tracer = tracer.with_samply(config);
+        }
+
+        if self.tracy {
+            #[cfg(feature = "tracy")]
+            {
+                let config = self.layer_info(LogFormat::Terminal, self.tracy_filter.clone(), false);
+                tracer = tracer.with_tracy(config);
+            }
+            #[cfg(not(feature = "tracy"))]
+            {
+                tracing::warn!("`--log.tracy` requested but `tracy` feature was not compiled in");
+            }
+        }
+
+        tracer.with_reload(enable_reload).init_with_layers(layers)
     }
 }
 
@@ -120,7 +215,7 @@ impl LogArgs {
 pub enum ColorMode {
     /// Colors on
     Always,
-    /// Colors on
+    /// Auto-detect
     Auto,
     /// Colors off
     Never,

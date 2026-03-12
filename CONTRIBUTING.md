@@ -3,7 +3,7 @@
 Thanks for your interest in improving Reth!
 
 There are multiple opportunities to contribute at any level. It doesn't matter if you are just getting started with Rust
-or are the most weathered expert, we can use your help.
+or if you are already the most weathered expert, we can use your help.
 
 **No contribution is too small and all contributions are valued.**
 
@@ -51,11 +51,9 @@ elsewhere.
 <!-- -   **Asking in the support Telegram:** The [Foundry Support Telegram][support-tg] is a fast and easy way to ask questions. -->
 <!-- -   **Opening a discussion:** This repository comes with a discussions board where you can also ask for help. Click the "Discussions" tab at the top. -->
 
-If you have reviewed existing documentation and still have questions, or you are having problems, you can get help by *
-*opening a discussion**. This repository comes with a discussions board where you can also ask for help. Click the "
-Discussions" tab at the top.
+If you have reviewed existing documentation and still have questions, or you are having problems, you can get help by **opening a discussion**. This repository comes with a discussions board where you can also ask for help. Click the "Discussions" tab at the top.
 
-As Reth is still in heavy development, the documentation can be a bit scattered. The [Reth Book][reth-book] is our
+As Reth is still in heavy development, the documentation can be a bit scattered. The [Reth Docs][reth-docs] is our
 current best-effort attempt at keeping up-to-date information.
 
 ### Submitting a bug report
@@ -235,7 +233,7 @@ _Adapted from the [Foundry contributing guide][foundry-contributing]_.
 
 [dev-tg]: https://t.me/paradigm_reth
 
-[reth-book]: https://github.com/paradigmxyz/reth/tree/main/book
+[reth-docs]: https://github.com/paradigmxyz/reth/tree/main/docs
 
 [mcve]: https://stackoverflow.com/help/mcve
 

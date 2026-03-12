@@ -12,23 +12,27 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 mod admin;
 mod anvil;
 mod debug;
 mod engine;
-mod ganache;
 mod hardhat;
 mod mev;
+mod miner;
 mod net;
 mod otterscan;
 mod reth;
+mod reth_engine;
 mod rpc;
+mod testing;
 mod trace;
 mod txpool;
 mod validation;
 mod web3;
+
+pub use testing::{TestingBuildBlockRequestV1, TESTING_BUILD_BLOCK_V1};
 
 /// re-export of all server traits
 pub use servers::*;
@@ -37,13 +41,16 @@ pub use servers::*;
 pub mod servers {
     pub use crate::{
         admin::AdminApiServer,
-        debug::DebugApiServer,
-        engine::{EngineApiServer, EngineEthApiServer},
+        debug::{DebugApiServer, DebugExecutionWitnessApiServer},
+        engine::{EngineApiServer, EngineEthApiServer, IntoEngineApiRpcModule},
         mev::{MevFullApiServer, MevSimApiServer},
+        miner::MinerApiServer,
         net::NetApiServer,
         otterscan::OtterscanServer,
         reth::RethApiServer,
+        reth_engine::{RethEngineApiServer, RethNewPayloadInput, RethPayloadStatus},
         rpc::RpcApiServer,
+        testing::TestingApiServer,
         trace::TraceApiServer,
         txpool::TxPoolApiServer,
         validation::BlockSubmissionValidationApiServer,
@@ -51,7 +58,7 @@ pub mod servers {
     };
     pub use reth_rpc_eth_api::{
         self as eth, EthApiServer, EthBundleApiServer, EthCallBundleApiServer, EthFilterApiServer,
-        EthPubSubApiServer,
+        EthPubSubApiServer, L2EthApiExtServer,
     };
 }
 
@@ -65,15 +72,17 @@ pub mod clients {
     pub use crate::{
         admin::AdminApiClient,
         anvil::AnvilApiClient,
-        debug::DebugApiClient,
+        debug::{DebugApiClient, DebugExecutionWitnessApiClient},
         engine::{EngineApiClient, EngineEthApiClient},
-        ganache::GanacheApiClient,
         hardhat::HardhatApiClient,
         mev::{MevFullApiClient, MevSimApiClient},
+        miner::MinerApiClient,
         net::NetApiClient,
         otterscan::OtterscanClient,
         reth::RethApiClient,
+        reth_engine::RethEngineApiClient,
         rpc::RpcApiServer,
+        testing::TestingApiClient,
         trace::TraceApiClient,
         txpool::TxPoolApiClient,
         validation::BlockSubmissionValidationApiClient,
@@ -81,5 +90,6 @@ pub mod clients {
     };
     pub use reth_rpc_eth_api::{
         EthApiClient, EthBundleApiClient, EthCallBundleApiClient, EthFilterApiClient,
+        L2EthApiExtServer,
     };
 }

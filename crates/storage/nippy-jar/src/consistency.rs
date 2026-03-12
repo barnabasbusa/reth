@@ -37,12 +37,12 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
         Self { jar, data_file: None, offsets_file: None }
     }
 
-    /// It will throw an error if the [`NippyJar`] is in a inconsistent state.
+    /// It will throw an error if the [`NippyJar`] is in an inconsistent state.
     pub fn check_consistency(&mut self) -> Result<(), NippyJarError> {
         self.handle_consistency(ConsistencyFailStrategy::ThrowError)
     }
 
-    /// It will attempt to heal if the [`NippyJar`] is in a inconsistent state.
+    /// It will attempt to heal if the [`NippyJar`] is in an inconsistent state.
     ///
     /// **ATTENTION**: disk commit should be handled externally by consuming `Self`
     pub fn ensure_consistency(&mut self) -> Result<(), NippyJarError> {
@@ -168,14 +168,14 @@ impl<H: NippyJarHeader> NippyJarChecker<H> {
     /// Returns a mutable reference to offsets file.
     ///
     /// **Panics** if it does not exist.
-    fn offsets_file(&mut self) -> &mut BufWriter<File> {
+    const fn offsets_file(&mut self) -> &mut BufWriter<File> {
         self.offsets_file.as_mut().expect("should exist")
     }
 
     /// Returns a mutable reference to data file.
     ///
     /// **Panics** if it does not exist.
-    fn data_file(&mut self) -> &mut BufWriter<File> {
+    const fn data_file(&mut self) -> &mut BufWriter<File> {
         self.data_file.as_mut().expect("should exist")
     }
 }

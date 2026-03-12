@@ -1,28 +1,43 @@
-//! Common receipts pruning logic shared between user and static file pruning segments.
+//! Common receipts pruning logic.
 //!
 //! - [`crate::segments::user::Receipts`] is responsible for pruning receipts according to the
 //!   user-configured settings (for example, on a full node or with a custom prune config)
-//! - [`crate::segments::static_file::Receipts`] is responsible for pruning receipts on an archive
-//!   node after static file producer has finished
 
-use crate::{db_ext::DbTxPruneExt, segments::PruneInput, PrunerError};
-use reth_db::{tables, transaction::DbTxMut};
+use crate::{
+    db_ext::DbTxPruneExt,
+    segments::{self, PruneInput},
+    PrunerError,
+};
+use reth_db_api::{table::Value, tables, transaction::DbTxMut};
+use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    errors::provider::ProviderResult, BlockReader, DBProvider, PruneCheckpointWriter,
+    errors::provider::ProviderResult, BlockReader, DBProvider, EitherWriter,
+    NodePrimitivesProvider, PruneCheckpointWriter, StaticFileProviderFactory, StorageSettingsCache,
     TransactionsProvider,
 };
-use reth_prune_types::{
-    PruneCheckpoint, PruneProgress, PruneSegment, SegmentOutput, SegmentOutputCheckpoint,
-};
-use tracing::trace;
+use reth_prune_types::{PruneCheckpoint, PruneSegment, SegmentOutput, SegmentOutputCheckpoint};
+use reth_static_file_types::StaticFileSegment;
+use tracing::{debug, trace};
 
 pub(crate) fn prune<Provider>(
     provider: &Provider,
     input: PruneInput,
 ) -> Result<SegmentOutput, PrunerError>
 where
-    Provider: DBProvider<Tx: DbTxMut> + TransactionsProvider + BlockReader,
+    Provider: DBProvider<Tx: DbTxMut>
+        + TransactionsProvider
+        + BlockReader
+        + StorageSettingsCache
+        + StaticFileProviderFactory
+        + NodePrimitivesProvider<Primitives: NodePrimitives<Receipt: Value>>,
 {
+    if EitherWriter::receipts_destination(provider).is_static_file() {
+        debug!(target: "pruner", "Pruning receipts from static files.");
+        return segments::prune_static_files(provider, input, StaticFileSegment::Receipts)
+    }
+    debug!(target: "pruner", "Pruning receipts from database.");
+
+    // Original database implementation for when receipts are not on static files (old nodes)
     let tx_range = match input.get_next_tx_num_range(provider)? {
         Some(range) => range,
         None => {
@@ -35,7 +50,9 @@ where
     let mut limiter = input.limiter;
 
     let mut last_pruned_transaction = tx_range_end;
-    let (pruned, done) = provider.tx_ref().prune_table_with_range::<tables::Receipts>(
+    let (pruned, done) = provider.tx_ref().prune_table_with_range::<tables::Receipts<
+        <Provider::Primitives as NodePrimitives>::Receipt,
+    >>(
         tx_range,
         &mut limiter,
         |_| false,
@@ -44,13 +61,13 @@ where
     trace!(target: "pruner", %pruned, %done, "Pruned receipts");
 
     let last_pruned_block = provider
-        .transaction_block(last_pruned_transaction)?
+        .block_by_transaction_id(last_pruned_transaction)?
         .ok_or(PrunerError::InconsistentData("Block for transaction is not found"))?
         // If there's more receipts to prune, set the checkpoint block number to previous,
         // so we could finish pruning its receipts on the next run.
         .checked_sub(if done { 0 } else { 1 });
 
-    let progress = PruneProgress::new(done, &limiter);
+    let progress = limiter.progress(done);
 
     Ok(SegmentOutput {
         progress,
@@ -77,17 +94,17 @@ pub(crate) fn save_checkpoint(
 
 #[cfg(test)]
 mod tests {
-    use crate::segments::{PruneInput, SegmentOutput};
+    use crate::segments::{PruneInput, PruneLimiter, SegmentOutput};
     use alloy_primitives::{BlockNumber, TxNumber, B256};
     use assert_matches::assert_matches;
     use itertools::{
         FoldWhile::{Continue, Done},
         Itertools,
     };
-    use reth_db::tables;
-    use reth_provider::{DatabaseProviderFactory, PruneCheckpointReader};
+    use reth_db_api::tables;
+    use reth_provider::{DBProvider, DatabaseProviderFactory, PruneCheckpointReader};
     use reth_prune_types::{
-        PruneCheckpoint, PruneInterruptReason, PruneLimiter, PruneMode, PruneProgress, PruneSegment,
+        PruneCheckpoint, PruneInterruptReason, PruneMode, PruneProgress, PruneSegment,
     };
     use reth_stages::test_utils::{StorageKind, TestStageDB};
     use reth_testing_utils::generators::{
@@ -96,8 +113,14 @@ mod tests {
     use std::ops::Sub;
 
     #[test]
-    fn prune() {
-        let db = TestStageDB::default();
+    fn prune_legacy() {
+        let mut db = TestStageDB::default();
+        // Configure the factory to use database for receipts by enabling receipt pruning.
+        // This ensures EitherWriter::receipts_destination returns Database instead of StaticFile.
+        db.factory = db.factory.with_prune_modes(reth_prune_types::PruneModes {
+            receipts: Some(PruneMode::Full),
+            ..Default::default()
+        });
         let mut rng = generators::rng();
 
         let blocks = random_block_range(
@@ -109,10 +132,12 @@ mod tests {
 
         let mut receipts = Vec::new();
         for block in &blocks {
-            receipts.reserve_exact(block.body.transactions.len());
-            for transaction in &block.body.transactions {
-                receipts
-                    .push((receipts.len() as u64, random_receipt(&mut rng, transaction, Some(0))));
+            receipts.reserve_exact(block.transaction_count());
+            for transaction in &block.body().transactions {
+                receipts.push((
+                    receipts.len() as u64,
+                    random_receipt(&mut rng, transaction, Some(0), None),
+                ));
             }
         }
         let receipts_len = receipts.len();
@@ -120,7 +145,7 @@ mod tests {
 
         assert_eq!(
             db.table::<tables::Transactions>().unwrap().len(),
-            blocks.iter().map(|block| block.body.transactions.len()).sum::<usize>()
+            blocks.iter().map(|block| block.transaction_count()).sum::<usize>()
         );
         assert_eq!(
             db.table::<tables::Transactions>().unwrap().len(),
@@ -154,7 +179,7 @@ mod tests {
             let last_pruned_tx_number = blocks
                 .iter()
                 .take(to_block as usize)
-                .map(|block| block.body.transactions.len())
+                .map(|block| block.transaction_count())
                 .sum::<usize>()
                 .min(
                     next_tx_number_to_prune as usize +
@@ -182,7 +207,7 @@ mod tests {
             let last_pruned_block_number = blocks
                 .iter()
                 .fold_while((0, 0), |(_, mut tx_count), block| {
-                    tx_count += block.body.transactions.len();
+                    tx_count += block.transaction_count();
 
                     if tx_count > last_pruned_tx_number {
                         Done((block.number, tx_count))

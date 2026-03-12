@@ -7,7 +7,7 @@ macro_rules! cond_mod {
             #[cfg(feature = "test-utils")]
             pub mod $mod_name;
             #[cfg(not(feature = "test-utils"))]
-            mod $mod_name;
+            pub(crate) mod $mod_name;
         )*
     };
 }
@@ -18,12 +18,17 @@ cond_mod!(
     genesis_account,
     header,
     log,
+    receipt,
     signature,
-    transaction,
     trie,
     txkind,
     withdrawal
 );
+
+#[cfg(all(feature = "op", feature = "std"))]
+pub mod optimism;
+
+pub mod transaction;
 
 #[cfg(test)]
 mod tests {

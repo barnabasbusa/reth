@@ -1,4 +1,6 @@
-//! This crate defines abstractions to create and update payloads (blocks)
+//! Abstractions for working with execution payloads.
+//!
+//! This crate provides types and traits for execution and building payloads.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -6,39 +8,61 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+use alloy_primitives::Bytes;
+use reth_chainspec::EthereumHardforks;
+use reth_primitives_traits::{NodePrimitives, SealedBlock};
 
 mod error;
+pub use error::{
+    EngineObjectValidationError, InvalidPayloadAttributesError, NewPayloadError,
+    PayloadBuilderError, VersionSpecificValidationError,
+};
 
-pub use error::{EngineObjectValidationError, PayloadBuilderError, VersionSpecificValidationError};
-
-mod events;
-pub use crate::events::{Events, PayloadEvents};
-
-/// Contains traits to abstract over payload attributes types and default implementations of the
-/// [`PayloadAttributes`] trait for ethereum mainnet and optimism types.
 mod traits;
 pub use traits::{
-    BuiltPayload, PayloadAttributes, PayloadAttributesBuilder, PayloadBuilder,
-    PayloadBuilderAttributes,
+    BuildNextEnv, BuiltPayload, BuiltPayloadExecutedBlock, PayloadAttributes,
+    PayloadAttributesBuilder, PayloadBuilderAttributes,
 };
 
 mod payload;
-pub use payload::PayloadOrAttributes;
+pub use payload::{ExecutionPayload, PayloadOrAttributes};
 
-use reth_chainspec::EthereumHardforks;
-/// The types that are used by the engine API.
+/// Core trait that defines the associated types for working with execution payloads.
 pub trait PayloadTypes: Send + Sync + Unpin + core::fmt::Debug + Clone + 'static {
-    /// The built payload type.
+    /// The format for execution payload data that can be processed and validated.
+    ///
+    /// This type represents the canonical format for block data that includes
+    /// all necessary information for execution and validation.
+    type ExecutionData: ExecutionPayload;
+    /// The type representing a successfully built payload/block.
     type BuiltPayload: BuiltPayload + Clone + Unpin;
 
-    /// The RPC payload attributes type the CL node emits via the engine API.
+    /// Attributes that specify how a payload should be constructed.
+    ///
+    /// These attributes typically come from external sources (e.g., consensus layer over RPC such
+    /// as the Engine API) and contain parameters like timestamp, fee recipient, and randomness.
     type PayloadAttributes: PayloadAttributes + Unpin;
 
-    /// The payload attributes type that contains information about a running payload job.
+    /// Extended attributes used internally during payload building.
+    ///
+    /// This type augments the basic payload attributes with additional information
+    /// needed during the building process, such as unique identifiers and parent
+    /// block references.
     type PayloadBuilderAttributes: PayloadBuilderAttributes<RpcPayloadAttributes = Self::PayloadAttributes>
         + Clone
         + Unpin;
+
+    /// Converts a sealed block into the execution payload format.
+    fn block_to_payload(
+        block: SealedBlock<
+            <<Self::BuiltPayload as BuiltPayload>::Primitives as NodePrimitives>::Block,
+        >,
+    ) -> Self::ExecutionData;
 }
 
 /// Validates the timestamp depending on the version called:
@@ -46,15 +70,19 @@ pub trait PayloadTypes: Send + Sync + Unpin + core::fmt::Debug + Clone + 'static
 /// * If V2, this ensures that the payload timestamp is pre-Cancun.
 /// * If V3, this ensures that the payload timestamp is within the Cancun timestamp.
 /// * If V4, this ensures that the payload timestamp is within the Prague timestamp.
+/// * If V5, this ensures that the payload timestamp is within the Osaka timestamp.
+///
+/// Additionally, it ensures that `engine_getPayloadV4` is not used for an Osaka payload.
 ///
 /// Otherwise, this will return [`EngineObjectValidationError::UnsupportedFork`].
 pub fn validate_payload_timestamp(
     chain_spec: impl EthereumHardforks,
     version: EngineApiMessageVersion,
     timestamp: u64,
+    kind: MessageValidationKind,
 ) -> Result<(), EngineObjectValidationError> {
     let is_cancun = chain_spec.is_cancun_active_at_timestamp(timestamp);
-    if version == EngineApiMessageVersion::V2 && is_cancun {
+    if version.is_v2() && is_cancun {
         // From the Engine API spec:
         //
         // ### Update the methods of previous forks
@@ -75,7 +103,7 @@ pub fn validate_payload_timestamp(
         return Err(EngineObjectValidationError::UnsupportedFork)
     }
 
-    if version == EngineApiMessageVersion::V3 && !is_cancun {
+    if version.is_v3() && !is_cancun {
         // From the Engine API spec:
         // <https://github.com/ethereum/execution-apis/blob/ff43500e653abde45aec0f545564abfb648317af/src/engine/cancun.md#specification-2>
         //
@@ -98,7 +126,7 @@ pub fn validate_payload_timestamp(
     }
 
     let is_prague = chain_spec.is_prague_active_at_timestamp(timestamp);
-    if version == EngineApiMessageVersion::V4 && !is_prague {
+    if version.is_v4() && !is_prague {
         // From the Engine API spec:
         // <https://github.com/ethereum/execution-apis/blob/7907424db935b93c2fe6a3c0faab943adebe8557/src/engine/prague.md#specification-1>
         //
@@ -119,6 +147,24 @@ pub fn validate_payload_timestamp(
         //    the payload does not fall within the time frame of the Prague fork.
         return Err(EngineObjectValidationError::UnsupportedFork)
     }
+
+    let is_osaka = chain_spec.is_osaka_active_at_timestamp(timestamp);
+    if version.is_v5() && !is_osaka {
+        // From the Engine API spec:
+        // <https://github.com/ethereum/execution-apis/blob/15399c2e2f16a5f800bf3f285640357e2c245ad9/src/engine/osaka.md#specification>
+        //
+        // For `engine_getPayloadV5`
+        //
+        // 1. Client software MUST return -38005: Unsupported fork error if the timestamp of the
+        //    built payload does not fall within the time frame of the Osaka fork.
+        return Err(EngineObjectValidationError::UnsupportedFork)
+    }
+
+    // `engine_getPayloadV4` MUST reject payloads with a timestamp >= Osaka.
+    if version.is_v4() && kind == MessageValidationKind::GetPayload && is_osaka {
+        return Err(EngineObjectValidationError::UnsupportedFork)
+    }
+
     Ok(())
 }
 
@@ -141,7 +187,10 @@ pub fn validate_withdrawals_presence<T: EthereumHardforks>(
                     .to_error(VersionSpecificValidationError::WithdrawalsNotSupportedInV1))
             }
         }
-        EngineApiMessageVersion::V2 | EngineApiMessageVersion::V3 | EngineApiMessageVersion::V4 => {
+        EngineApiMessageVersion::V2 |
+        EngineApiMessageVersion::V3 |
+        EngineApiMessageVersion::V4 |
+        EngineApiMessageVersion::V5 => {
             if is_shanghai_active && !has_withdrawals {
                 return Err(message_validation_kind
                     .to_error(VersionSpecificValidationError::NoWithdrawalsPostShanghai))
@@ -242,7 +291,7 @@ pub fn validate_parent_beacon_block_root_presence<T: EthereumHardforks>(
                 ))
             }
         }
-        EngineApiMessageVersion::V3 | EngineApiMessageVersion::V4 => {
+        EngineApiMessageVersion::V3 | EngineApiMessageVersion::V4 | EngineApiMessageVersion::V5 => {
             if !has_parent_beacon_block_root {
                 return Err(validation_kind
                     .to_error(VersionSpecificValidationError::NoParentBeaconBlockRootPostCancun))
@@ -260,7 +309,7 @@ pub fn validate_parent_beacon_block_root_presence<T: EthereumHardforks>(
     //
     // 2. Client software **MUST** return `-38005: Unsupported fork` error if the `timestamp` of the
     //    payload does not fall within the time frame of the Cancun fork.
-    validate_payload_timestamp(chain_spec, version, timestamp)?;
+    validate_payload_timestamp(chain_spec, version, timestamp, validation_kind)?;
 
     Ok(())
 }
@@ -272,9 +321,14 @@ pub fn validate_parent_beacon_block_root_presence<T: EthereumHardforks>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageValidationKind {
     /// We are validating fields of a payload attributes.
+    /// This corresponds to `engine_forkchoiceUpdated`.
     PayloadAttributes,
     /// We are validating fields of a payload.
+    /// This corresponds to `engine_newPayload`.
     Payload,
+    /// We are validating a built payload.
+    /// This corresponds to `engine_getPayload`.
+    GetPayload,
 }
 
 impl MessageValidationKind {
@@ -285,7 +339,9 @@ impl MessageValidationKind {
         error: VersionSpecificValidationError,
     ) -> EngineObjectValidationError {
         match self {
-            Self::Payload => EngineObjectValidationError::Payload(error),
+            // Both NewPayload and GetPayload errors are treated as generic Payload validation
+            // errors
+            Self::Payload | Self::GetPayload => EngineObjectValidationError::Payload(error),
             Self::PayloadAttributes => EngineObjectValidationError::PayloadAttributes(error),
         }
     }
@@ -298,12 +354,13 @@ impl MessageValidationKind {
 /// either an execution payload, or payload attributes.
 ///
 /// The version is provided by the [`EngineApiMessageVersion`] argument.
-pub fn validate_version_specific_fields<Type, T>(
+pub fn validate_version_specific_fields<Payload, Type, T>(
     chain_spec: &T,
     version: EngineApiMessageVersion,
-    payload_or_attrs: PayloadOrAttributes<'_, Type>,
+    payload_or_attrs: PayloadOrAttributes<'_, Payload, Type>,
 ) -> Result<(), EngineObjectValidationError>
 where
+    Payload: ExecutionPayload,
     Type: PayloadAttributes,
     T: EthereumHardforks,
 {
@@ -335,12 +392,54 @@ pub enum EngineApiMessageVersion {
     /// Version 3
     ///
     /// Added in the Cancun hardfork.
-    #[default]
     V3 = 3,
     /// Version 4
     ///
     /// Added in the Prague hardfork.
+    #[default]
     V4 = 4,
+    /// Version 5
+    ///
+    /// Added in the Osaka hardfork.
+    V5 = 5,
+}
+
+impl EngineApiMessageVersion {
+    /// Returns true if the version is V1.
+    pub const fn is_v1(&self) -> bool {
+        matches!(self, Self::V1)
+    }
+
+    /// Returns true if the version is V2.
+    pub const fn is_v2(&self) -> bool {
+        matches!(self, Self::V2)
+    }
+
+    /// Returns true if the version is V3.
+    pub const fn is_v3(&self) -> bool {
+        matches!(self, Self::V3)
+    }
+
+    /// Returns true if the version is V4.
+    pub const fn is_v4(&self) -> bool {
+        matches!(self, Self::V4)
+    }
+
+    /// Returns true if the version is V5.
+    pub const fn is_v5(&self) -> bool {
+        matches!(self, Self::V5)
+    }
+
+    /// Returns the method name for the given version.
+    pub const fn method_name(&self) -> &'static str {
+        match self {
+            Self::V1 => "engine_newPayloadV1",
+            Self::V2 => "engine_newPayloadV2",
+            Self::V3 => "engine_newPayloadV3",
+            Self::V4 => "engine_newPayloadV4",
+            Self::V5 => "engine_newPayloadV5",
+        }
+    }
 }
 
 /// Determines how we should choose the payload to return.
@@ -365,12 +464,129 @@ pub enum PayloadKind {
     WaitForPending,
 }
 
+/// Validates that execution requests are valid according to Engine API specification.
+///
+/// `executionRequests`: `Array of DATA` - List of execution layer triggered requests. Each list
+/// element is a `requests` byte array as defined by [EIP-7685](https://eips.ethereum.org/EIPS/eip-7685).
+/// The first byte of each element is the `request_type` and the remaining bytes are the
+/// `request_data`. Elements of the list **MUST** be ordered by `request_type` in ascending order.
+/// Elements with empty `request_data` **MUST** be excluded from the list. If any element is out of
+/// order, has a length of 1-byte or shorter, or more than one element has the same type byte,
+/// client software **MUST** return `-32602: Invalid params` error.
+pub fn validate_execution_requests(requests: &[Bytes]) -> Result<(), EngineObjectValidationError> {
+    let mut last_request_type = None;
+    for request in requests {
+        if request.len() <= 1 {
+            return Err(EngineObjectValidationError::InvalidParams("EmptyExecutionRequest".into()))
+        }
+
+        let request_type = request[0];
+        if Some(request_type) < last_request_type {
+            return Err(EngineObjectValidationError::InvalidParams(
+                "OutOfOrderExecutionRequest".into(),
+            ))
+        }
+
+        if Some(request_type) == last_request_type {
+            return Err(EngineObjectValidationError::InvalidParams(
+                "DuplicatedExecutionRequestType".into(),
+            ))
+        }
+
+        last_request_type = Some(request_type);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
+    use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition};
 
     #[test]
     fn version_ord() {
         assert!(EngineApiMessageVersion::V4 > EngineApiMessageVersion::V3);
+    }
+
+    #[test]
+    fn validate_osaka_get_payload_restrictions() {
+        // Osaka activates at timestamp 1000
+        let osaka_activation = 1000;
+        let chain_spec = ChainSpecBuilder::mainnet()
+            .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(0))
+            .with_fork(EthereumHardfork::Osaka, ForkCondition::Timestamp(osaka_activation))
+            .build();
+
+        // Osaka is Active + V4 + GetPayload
+        let res = validate_payload_timestamp(
+            &chain_spec,
+            EngineApiMessageVersion::V4,
+            osaka_activation,
+            MessageValidationKind::GetPayload,
+        );
+        assert_matches!(res, Err(EngineObjectValidationError::UnsupportedFork));
+
+        // Osaka is Active + V4 + Payload (NewPayload)
+        let res = validate_payload_timestamp(
+            &chain_spec,
+            EngineApiMessageVersion::V4,
+            osaka_activation,
+            MessageValidationKind::Payload,
+        );
+        assert_matches!(res, Ok(()));
+    }
+
+    #[test]
+    fn execution_requests_validation() {
+        assert_matches!(validate_execution_requests(&[]), Ok(()));
+
+        let valid_requests = [
+            Bytes::from_iter([1, 2]),
+            Bytes::from_iter([2, 3]),
+            Bytes::from_iter([3, 4]),
+            Bytes::from_iter([4, 5]),
+        ];
+        assert_matches!(validate_execution_requests(&valid_requests), Ok(()));
+
+        let requests_with_empty = [
+            Bytes::from_iter([1, 2]),
+            Bytes::from_iter([2, 3]),
+            Bytes::new(),
+            Bytes::from_iter([3, 4]),
+        ];
+        assert_matches!(
+            validate_execution_requests(&requests_with_empty),
+            Err(EngineObjectValidationError::InvalidParams(_))
+        );
+
+        let mut requests_valid_reversed = valid_requests;
+        requests_valid_reversed.reverse();
+        assert_matches!(
+            validate_execution_requests(&requests_valid_reversed),
+            Err(EngineObjectValidationError::InvalidParams(_))
+        );
+
+        let requests_out_of_order = [
+            Bytes::from_iter([1, 2]),
+            Bytes::from_iter([2, 3]),
+            Bytes::from_iter([4, 5]),
+            Bytes::from_iter([3, 4]),
+        ];
+        assert_matches!(
+            validate_execution_requests(&requests_out_of_order),
+            Err(EngineObjectValidationError::InvalidParams(_))
+        );
+
+        let duplicate_request_types = [
+            Bytes::from_iter([1, 2]),
+            Bytes::from_iter([3, 3]),
+            Bytes::from_iter([4, 5]),
+            Bytes::from_iter([4, 4]),
+        ];
+        assert_matches!(
+            validate_execution_requests(&duplicate_request_types),
+            Err(EngineObjectValidationError::InvalidParams(_))
+        );
     }
 }

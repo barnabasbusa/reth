@@ -6,24 +6,31 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// A configurable App on top of the cli parser.
+pub mod app;
 /// Chain specification parser.
 pub mod chainspec;
+pub mod interface;
+
+pub use app::{CliApp, ExtendedCommand};
+pub use interface::{Cli, Commands, NoSubCmd};
 
 #[cfg(test)]
 mod test {
+    use crate::chainspec::EthereumChainSpecParser;
     use clap::Parser;
     use reth_chainspec::DEV;
     use reth_cli_commands::NodeCommand;
 
     #[test]
-    #[ignore = "reth cmd will print op-reth output if optimism feature enabled"]
+    #[ignore = "reth cmd output differs when optimism feature enabled"]
     fn parse_dev() {
-        let cmd: NodeCommand = NodeCommand::parse_from(["reth", "--dev"]);
+        let cmd: NodeCommand<EthereumChainSpecParser> = NodeCommand::parse_from(["reth", "--dev"]);
         let chain = DEV.clone();
         assert_eq!(cmd.chain.chain, chain.chain);
-        assert_eq!(cmd.chain.genesis_hash, chain.genesis_hash);
+        assert_eq!(cmd.chain.genesis_hash(), chain.genesis_hash());
         assert_eq!(
             cmd.chain.paris_block_and_final_difficulty,
             chain.paris_block_and_final_difficulty

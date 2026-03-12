@@ -5,7 +5,7 @@ use proptest::prelude::*;
 use proptest_arbitrary_interop::arb;
 use reth_db::{tables, test_utils::create_test_rw_db};
 use reth_db_api::{database::Database, transaction::DbTxMut};
-use reth_primitives::{Account, StorageEntry};
+use reth_primitives_traits::{Account, StorageEntry};
 use reth_trie::{
     hashed_cursor::{
         HashedCursor, HashedCursorFactory, HashedPostStateCursorFactory, HashedStorageCursor,
@@ -100,14 +100,14 @@ fn account_cursor_correct_order() {
 
     let db = create_test_rw_db();
     db.update(|tx| {
-        for (key, account) in accounts.iter().filter(|x| x.0[31] % 2 == 0) {
+        for (key, account) in accounts.iter().filter(|x| x.0[31].is_multiple_of(2)) {
             tx.put::<tables::HashedAccounts>(*key, *account).unwrap();
         }
     })
     .unwrap();
 
     let mut hashed_post_state = HashedPostState::default();
-    for (hashed_address, account) in accounts.iter().filter(|x| x.0[31] % 2 != 0) {
+    for (hashed_address, account) in accounts.iter().filter(|x| !x.0[31].is_multiple_of(2)) {
         hashed_post_state.accounts.insert(*hashed_address, Some(*account));
     }
 
@@ -127,14 +127,14 @@ fn removed_accounts_are_discarded() {
 
     let db = create_test_rw_db();
     db.update(|tx| {
-        for (key, account) in accounts.iter().filter(|x| x.0[31] % 2 == 0) {
+        for (key, account) in accounts.iter().filter(|x| x.0[31].is_multiple_of(2)) {
             tx.put::<tables::HashedAccounts>(*key, *account).unwrap();
         }
     })
     .unwrap();
 
     let mut hashed_post_state = HashedPostState::default();
-    for (hashed_address, account) in accounts.iter().filter(|x| x.0[31] % 2 != 0) {
+    for (hashed_address, account) in accounts.iter().filter(|x| !x.0[31].is_multiple_of(2)) {
         hashed_post_state.accounts.insert(
             *hashed_address,
             if removed_keys.contains(hashed_address) { None } else { Some(*account) },
@@ -208,6 +208,18 @@ fn fuzz_hashed_account_cursor() {
     );
 }
 
+/// Tests `is_storage_empty()` correctly distinguishes wiped storage from storage with zero values.
+///
+/// Key distinction:
+/// - `wiped = true`: Storage cleared/deleted → empty
+/// - `wiped = false` with zeros: Explicit zero values → not empty
+///
+/// Test cases:
+/// 1. No entries → empty
+/// 2. Non-zero values → not empty
+/// 3. Some zero values, not wiped → not empty
+/// 4. Wiped + zero post-state → empty
+/// 5. Wiped + non-zero post-state → not empty
 #[test]
 fn storage_is_empty() {
     let address = B256::random();
@@ -227,7 +239,7 @@ fn storage_is_empty() {
         (0..10).map(|key| (B256::with_last_byte(key), U256::from(key))).collect::<BTreeMap<_, _>>();
     db.update(|tx| {
         for (slot, value) in &db_storage {
-            // insert zero value accounts to the database
+            // insert storage entries to the database
             tx.put::<tables::HashedStorages>(address, StorageEntry { key: *slot, value: *value })
                 .unwrap();
         }
@@ -237,6 +249,23 @@ fn storage_is_empty() {
     // not empty
     {
         let sorted = HashedPostState::default().into_sorted();
+        let tx = db.tx().unwrap();
+        let factory =
+            HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(&tx), &sorted);
+        let mut cursor = factory.hashed_storage_cursor(address).unwrap();
+        assert!(!cursor.is_storage_empty().unwrap());
+    }
+
+    // Some zero values, but not wiped
+    {
+        let wiped = false;
+        let mut hashed_storage = HashedStorage::new(wiped);
+        hashed_storage.storage.insert(B256::with_last_byte(0), U256::ZERO);
+
+        let mut hashed_post_state = HashedPostState::default();
+        hashed_post_state.storages.insert(address, hashed_storage);
+
+        let sorted = hashed_post_state.into_sorted();
         let tx = db.tx().unwrap();
         let factory =
             HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(&tx), &sorted);
@@ -338,14 +367,17 @@ fn zero_value_storage_entries_are_discarded() {
         (0..10).map(|key| (B256::with_last_byte(key), U256::from(key))).collect::<BTreeMap<_, _>>(); // every even number is changed to zero value
     let post_state_storage = (0..10)
         .map(|key| {
-            (B256::with_last_byte(key), if key % 2 == 0 { U256::ZERO } else { U256::from(key) })
+            (
+                B256::with_last_byte(key),
+                if key.is_multiple_of(2) { U256::ZERO } else { U256::from(key) },
+            )
         })
         .collect::<BTreeMap<_, _>>();
 
     let db = create_test_rw_db();
     db.update(|tx| {
         for (slot, value) in db_storage {
-            // insert zero value accounts to the database
+            // insert storage entries to the database
             tx.put::<tables::HashedStorages>(address, StorageEntry { key: slot, value }).unwrap();
         }
     })
@@ -484,4 +516,81 @@ fn fuzz_hashed_storage_cursor() {
         let factory = HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(&tx), &sorted);
         assert_storage_cursor_order(&factory, expected.into_iter());
     });
+}
+
+#[test]
+fn all_storage_slots_deleted_not_wiped_exact_keys() {
+    // This test reproduces an edge case where:
+    // - wiped = false
+    // - All post state entries are deletions (None values)
+    // - Database has corresponding entries
+    // - Expected: NO leaves should be returned (all deleted)
+    let address = B256::random();
+
+    // Generate 42 storage entries with keys distributed across the keyspace
+    let db_entries: Vec<(B256, u64)> = (0..42)
+        .map(|i| {
+            let mut key_bytes = [0u8; 32];
+            key_bytes[0] = (i * 6) as u8; // Spread keys across keyspace
+            key_bytes[31] = i as u8; // Ensure uniqueness
+            (B256::from(key_bytes), i as u64 + 1)
+        })
+        .collect();
+
+    let db = create_test_rw_db();
+    db.update(|tx| {
+        for (key, value) in &db_entries {
+            tx.put::<tables::HashedStorages>(
+                address,
+                StorageEntry { key: *key, value: U256::from(*value) },
+            )
+            .unwrap();
+        }
+    })
+    .unwrap();
+
+    // Create post state with same keys but all Zero values (deletions)
+    let mut hashed_storage = HashedStorage::new(false);
+    for (key, _) in &db_entries {
+        hashed_storage.storage.insert(*key, U256::ZERO); // Zero value = deletion
+    }
+
+    let mut hashed_post_state = HashedPostState::default();
+    hashed_post_state.storages.insert(address, hashed_storage);
+
+    let sorted = hashed_post_state.into_sorted();
+    let tx = db.tx().unwrap();
+    let factory = HashedPostStateCursorFactory::new(DatabaseHashedCursorFactory::new(&tx), &sorted);
+
+    let mut cursor = factory.hashed_storage_cursor(address).unwrap();
+
+    // Seek to beginning should return None (all slots are deleted)
+    let result = cursor.seek(B256::ZERO).unwrap();
+    assert_eq!(
+        result, None,
+        "Expected no entries when all slots are deleted, but got {:?}",
+        result
+    );
+
+    // Test seek operations at various positions - all should return None
+    // Pattern: before all, early range, mid-early range, mid-late range, late range, near end
+    let seek_keys = vec![
+        B256::ZERO, // Before all entries
+        B256::right_padding_from(&[0x5d]),
+        B256::right_padding_from(&[0x5e]),
+        B256::right_padding_from(&[0x5f]),
+        B256::right_padding_from(&[0xc2]),
+        B256::right_padding_from(&[0xc5]),
+        B256::right_padding_from(&[0xc9]),
+        B256::right_padding_from(&[0xf0]),
+    ];
+
+    for seek_key in seek_keys {
+        let result = cursor.seek(seek_key).unwrap();
+        assert_eq!(result, None, "Expected None when seeking to {} but got {:?}", seek_key, result);
+    }
+
+    // next() should also always return None
+    let result = cursor.next().unwrap();
+    assert_eq!(result, None, "Expected None from next() but got {:?}", result);
 }

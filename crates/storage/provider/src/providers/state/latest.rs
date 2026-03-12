@@ -1,62 +1,90 @@
 use crate::{
-    providers::{state::macros::delegate_provider_impls, StaticFileProvider},
-    AccountReader, BlockHashReader, StateProvider, StateRootProvider,
+    AccountReader, BlockHashReader, HashedPostStateProvider, StateProvider, StateRootProvider,
 };
-use alloy_primitives::{
-    map::{HashMap, HashSet},
-    Address, BlockNumber, Bytes, StorageKey, StorageValue, B256,
+use alloy_primitives::{Address, BlockNumber, Bytes, StorageKey, StorageValue, B256};
+use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
+use reth_primitives_traits::{Account, Bytecode};
+use reth_storage_api::{
+    BytecodeReader, DBProvider, StateProofProvider, StorageRootProvider, StorageSettingsCache,
 };
-use reth_db::tables;
-use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRO},
-    transaction::DbTx,
-};
-use reth_primitives::{Account, Bytecode, StaticFileSegment};
-use reth_storage_api::{StateProofProvider, StorageRootProvider};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use reth_trie::{
+    hashed_cursor::HashedPostStateCursorFactory,
     proof::{Proof, StorageProof},
+    trie_cursor::{masked::MaskedTrieCursorFactory, InMemoryTrieCursorFactory},
     updates::TrieUpdates,
     witness::TrieWitness,
-    AccountProof, HashedPostState, HashedStorage, MultiProof, StateRoot, StorageRoot, TrieInput,
+    AccountProof, HashedPostState, HashedStorage, KeccakKeyHasher, MultiProof, MultiProofTargets,
+    StateRoot, StorageMultiProof, StorageRoot, TrieInput, TrieInputSorted,
 };
-use reth_trie_db::{
-    DatabaseProof, DatabaseStateRoot, DatabaseStorageProof, DatabaseStorageRoot,
-    DatabaseTrieWitness,
-};
+use reth_trie_db::{DatabaseProof, DatabaseStateRoot, DatabaseStorageProof, DatabaseStorageRoot};
 
+type DbStateRoot<'a, TX, A> = StateRoot<
+    reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
+    reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
+>;
+type DbStorageRoot<'a, TX, A> = StorageRoot<
+    reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
+    reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
+>;
+type DbStorageProof<'a, TX, A> = StorageProof<
+    'static,
+    reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
+    reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
+>;
+type DbProof<'a, TX, A> = Proof<
+    reth_trie_db::DatabaseTrieCursorFactory<&'a TX, A>,
+    reth_trie_db::DatabaseHashedCursorFactory<&'a TX>,
+>;
 /// State provider over latest state that takes tx reference.
+///
+/// Wraps a [`DBProvider`] to get access to database.
 #[derive(Debug)]
-pub struct LatestStateProviderRef<'b, TX: DbTx> {
-    /// database transaction
-    tx: &'b TX,
-    /// Static File provider
-    static_file_provider: StaticFileProvider,
-}
+pub struct LatestStateProviderRef<'b, Provider>(&'b Provider);
 
-impl<'b, TX: DbTx> LatestStateProviderRef<'b, TX> {
+impl<'b, Provider: DBProvider> LatestStateProviderRef<'b, Provider> {
     /// Create new state provider
-    pub const fn new(tx: &'b TX, static_file_provider: StaticFileProvider) -> Self {
-        Self { tx, static_file_provider }
+    pub const fn new(provider: &'b Provider) -> Self {
+        Self(provider)
+    }
+
+    fn tx(&self) -> &Provider::Tx {
+        self.0.tx_ref()
+    }
+
+    fn hashed_storage_lookup(
+        &self,
+        hashed_address: B256,
+        hashed_slot: StorageKey,
+    ) -> ProviderResult<Option<StorageValue>> {
+        let mut cursor = self.tx().cursor_dup_read::<tables::HashedStorages>()?;
+        Ok(cursor
+            .seek_by_key_subkey(hashed_address, hashed_slot)?
+            .filter(|e| e.key == hashed_slot)
+            .map(|e| e.value))
     }
 }
 
-impl<TX: DbTx> AccountReader for LatestStateProviderRef<'_, TX> {
+impl<Provider: DBProvider + StorageSettingsCache> AccountReader
+    for LatestStateProviderRef<'_, Provider>
+{
     /// Get basic account information.
-    fn basic_account(&self, address: Address) -> ProviderResult<Option<Account>> {
-        self.tx.get::<tables::PlainAccountState>(address).map_err(Into::into)
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        if self.0.cached_storage_settings().use_hashed_state() {
+            let hashed_address = alloy_primitives::keccak256(address);
+            self.tx()
+                .get_by_encoded_key::<tables::HashedAccounts>(&hashed_address)
+                .map_err(Into::into)
+        } else {
+            self.tx().get_by_encoded_key::<tables::PlainAccountState>(address).map_err(Into::into)
+        }
     }
 }
 
-impl<TX: DbTx> BlockHashReader for LatestStateProviderRef<'_, TX> {
+impl<Provider: BlockHashReader> BlockHashReader for LatestStateProviderRef<'_, Provider> {
     /// Get block hash by number.
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            number,
-            |static_file| static_file.block_hash(number),
-            || Ok(self.tx.get::<tables::CanonicalHeaders>(number)?),
-        )
+        self.0.block_hash(number)
     }
 
     fn canonical_hashes_range(
@@ -64,62 +92,69 @@ impl<TX: DbTx> BlockHashReader for LatestStateProviderRef<'_, TX> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            start..end,
-            |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
-            |range, _| {
-                self.tx
-                    .cursor_read::<tables::CanonicalHeaders>()
-                    .map(|mut cursor| {
-                        cursor
-                            .walk_range(range)?
-                            .map(|result| result.map(|(_, hash)| hash).map_err(Into::into))
-                            .collect::<ProviderResult<Vec<_>>>()
-                    })?
-                    .map_err(Into::into)
-            },
-            |_| true,
-        )
+        self.0.canonical_hashes_range(start, end)
     }
 }
 
-impl<TX: DbTx> StateRootProvider for LatestStateProviderRef<'_, TX> {
+impl<Provider: DBProvider + StorageSettingsCache> StateRootProvider
+    for LatestStateProviderRef<'_, Provider>
+{
     fn state_root(&self, hashed_state: HashedPostState) -> ProviderResult<B256> {
-        StateRoot::overlay_root(self.tx, hashed_state)
-            .map_err(|err| ProviderError::Database(err.into()))
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let sorted = hashed_state.into_sorted();
+            Ok(<DbStateRoot<'_, _, A> as DatabaseStateRoot<_>>::overlay_root(self.tx(), &sorted)?)
+        })
     }
 
     fn state_root_from_nodes(&self, input: TrieInput) -> ProviderResult<B256> {
-        StateRoot::overlay_root_from_nodes(self.tx, input)
-            .map_err(|err| ProviderError::Database(err.into()))
+        reth_trie_db::with_adapter!(self.0, |A| {
+            Ok(<DbStateRoot<'_, _, A> as DatabaseStateRoot<_>>::overlay_root_from_nodes(
+                self.tx(),
+                TrieInputSorted::from_unsorted(input),
+            )?)
+        })
     }
 
     fn state_root_with_updates(
         &self,
         hashed_state: HashedPostState,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        StateRoot::overlay_root_with_updates(self.tx, hashed_state)
-            .map_err(|err| ProviderError::Database(err.into()))
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let sorted = hashed_state.into_sorted();
+            Ok(<DbStateRoot<'_, _, A> as DatabaseStateRoot<_>>::overlay_root_with_updates(
+                self.tx(),
+                &sorted,
+            )?)
+        })
     }
 
     fn state_root_from_nodes_with_updates(
         &self,
         input: TrieInput,
     ) -> ProviderResult<(B256, TrieUpdates)> {
-        StateRoot::overlay_root_from_nodes_with_updates(self.tx, input)
-            .map_err(|err| ProviderError::Database(err.into()))
+        reth_trie_db::with_adapter!(self.0, |A| {
+            Ok(
+                <DbStateRoot<'_, _, A> as DatabaseStateRoot<_>>::overlay_root_from_nodes_with_updates(
+                    self.tx(),
+                    TrieInputSorted::from_unsorted(input),
+                )?,
+            )
+        })
     }
 }
 
-impl<TX: DbTx> StorageRootProvider for LatestStateProviderRef<'_, TX> {
+impl<Provider: DBProvider + StorageSettingsCache> StorageRootProvider
+    for LatestStateProviderRef<'_, Provider>
+{
     fn storage_root(
         &self,
         address: Address,
         hashed_storage: HashedStorage,
     ) -> ProviderResult<B256> {
-        StorageRoot::overlay_root(self.tx, address, hashed_storage)
-            .map_err(|err| ProviderError::Database(err.into()))
+        reth_trie_db::with_adapter!(self.0, |A| {
+            <DbStorageRoot<'_, _, A>>::overlay_root(self.tx(), address, hashed_storage)
+                .map_err(|err| ProviderError::Database(err.into()))
+        })
     }
 
     fn storage_proof(
@@ -128,93 +163,272 @@ impl<TX: DbTx> StorageRootProvider for LatestStateProviderRef<'_, TX> {
         slot: B256,
         hashed_storage: HashedStorage,
     ) -> ProviderResult<reth_trie::StorageProof> {
-        StorageProof::overlay_storage_proof(self.tx, address, slot, hashed_storage)
-            .map_err(Into::<ProviderError>::into)
+        reth_trie_db::with_adapter!(self.0, |A| {
+            <DbStorageProof<'_, _, A>>::overlay_storage_proof(
+                self.tx(),
+                address,
+                slot,
+                hashed_storage,
+            )
+            .map_err(ProviderError::from)
+        })
+    }
+
+    fn storage_multiproof(
+        &self,
+        address: Address,
+        slots: &[B256],
+        hashed_storage: HashedStorage,
+    ) -> ProviderResult<StorageMultiProof> {
+        reth_trie_db::with_adapter!(self.0, |A| {
+            <DbStorageProof<'_, _, A>>::overlay_storage_multiproof(
+                self.tx(),
+                address,
+                slots,
+                hashed_storage,
+            )
+            .map_err(ProviderError::from)
+        })
     }
 }
 
-impl<TX: DbTx> StateProofProvider for LatestStateProviderRef<'_, TX> {
+impl<Provider: DBProvider + StorageSettingsCache> StateProofProvider
+    for LatestStateProviderRef<'_, Provider>
+{
     fn proof(
         &self,
         input: TrieInput,
         address: Address,
         slots: &[B256],
     ) -> ProviderResult<AccountProof> {
-        Proof::overlay_account_proof(self.tx, input, address, slots)
-            .map_err(Into::<ProviderError>::into)
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(self.tx());
+            proof.overlay_account_proof(input, address, slots).map_err(ProviderError::from)
+        })
     }
 
     fn multiproof(
         &self,
         input: TrieInput,
-        targets: HashMap<B256, HashSet<B256>>,
+        targets: MultiProofTargets,
     ) -> ProviderResult<MultiProof> {
-        Proof::overlay_multiproof(self.tx, input, targets).map_err(Into::<ProviderError>::into)
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let proof = <DbProof<'_, _, A> as DatabaseProof>::from_tx(self.tx());
+            proof.overlay_multiproof(input, targets).map_err(ProviderError::from)
+        })
     }
 
-    fn witness(
-        &self,
-        input: TrieInput,
-        target: HashedPostState,
-    ) -> ProviderResult<HashMap<B256, Bytes>> {
-        TrieWitness::overlay_witness(self.tx, input, target).map_err(Into::<ProviderError>::into)
+    fn witness(&self, input: TrieInput, target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+        reth_trie_db::with_adapter!(self.0, |A| {
+            let nodes_sorted = input.nodes.into_sorted();
+            let state_sorted = input.state.into_sorted();
+            Ok(TrieWitness::new(
+                MaskedTrieCursorFactory::new(
+                    InMemoryTrieCursorFactory::new(
+                        reth_trie_db::DatabaseTrieCursorFactory::<_, A>::new(self.tx()),
+                        &nodes_sorted,
+                    ),
+                    input.prefix_sets.freeze(),
+                ),
+                HashedPostStateCursorFactory::new(
+                    reth_trie_db::DatabaseHashedCursorFactory::new(self.tx()),
+                    &state_sorted,
+                ),
+            )
+            .always_include_root_node()
+            .compute(target)?
+            .into_values()
+            .collect())
+        })
     }
 }
 
-impl<TX: DbTx> StateProvider for LatestStateProviderRef<'_, TX> {
-    /// Get storage.
+impl<Provider: DBProvider> HashedPostStateProvider for LatestStateProviderRef<'_, Provider> {
+    fn hashed_post_state(&self, bundle_state: &revm_database::BundleState) -> HashedPostState {
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
+    }
+}
+
+impl<Provider: DBProvider + BlockHashReader + StorageSettingsCache> StateProvider
+    for LatestStateProviderRef<'_, Provider>
+{
+    /// Get storage by plain (unhashed) storage key slot.
     fn storage(
         &self,
         account: Address,
         storage_key: StorageKey,
     ) -> ProviderResult<Option<StorageValue>> {
-        let mut cursor = self.tx.cursor_dup_read::<tables::PlainStorageState>()?;
-        if let Some(entry) = cursor.seek_by_key_subkey(account, storage_key)? {
-            if entry.key == storage_key {
-                return Ok(Some(entry.value))
+        if self.0.cached_storage_settings().use_hashed_state() {
+            self.hashed_storage_lookup(
+                alloy_primitives::keccak256(account),
+                alloy_primitives::keccak256(storage_key),
+            )
+        } else {
+            let mut cursor = self.tx().cursor_dup_read::<tables::PlainStorageState>()?;
+            if let Some(entry) = cursor.seek_by_key_subkey(account, storage_key)? &&
+                entry.key == storage_key
+            {
+                return Ok(Some(entry.value));
             }
+            Ok(None)
         }
-        Ok(None)
     }
+}
 
+impl<Provider: DBProvider + BlockHashReader> BytecodeReader
+    for LatestStateProviderRef<'_, Provider>
+{
     /// Get account code by its hash
-    fn bytecode_by_hash(&self, code_hash: B256) -> ProviderResult<Option<Bytecode>> {
-        self.tx.get::<tables::Bytecodes>(code_hash).map_err(Into::into)
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        self.tx().get_by_encoded_key::<tables::Bytecodes>(code_hash).map_err(Into::into)
     }
 }
 
 /// State provider for the latest state.
 #[derive(Debug)]
-pub struct LatestStateProvider<TX: DbTx> {
-    /// database transaction
-    db: TX,
-    /// Static File provider
-    static_file_provider: StaticFileProvider,
-}
+pub struct LatestStateProvider<Provider>(Provider);
 
-impl<TX: DbTx> LatestStateProvider<TX> {
+impl<Provider: DBProvider> LatestStateProvider<Provider> {
     /// Create new state provider
-    pub const fn new(db: TX, static_file_provider: StaticFileProvider) -> Self {
-        Self { db, static_file_provider }
+    pub const fn new(db: Provider) -> Self {
+        Self(db)
     }
 
     /// Returns a new provider that takes the `TX` as reference
     #[inline(always)]
-    fn as_ref(&self) -> LatestStateProviderRef<'_, TX> {
-        LatestStateProviderRef::new(&self.db, self.static_file_provider.clone())
+    const fn as_ref(&self) -> LatestStateProviderRef<'_, Provider> {
+        LatestStateProviderRef::new(&self.0)
     }
 }
 
 // Delegates all provider impls to [LatestStateProviderRef]
-delegate_provider_impls!(LatestStateProvider<TX> where [TX: DbTx]);
+reth_storage_api::macros::delegate_provider_impls!(LatestStateProvider<Provider> where [Provider: DBProvider + BlockHashReader + StorageSettingsCache]);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::create_test_provider_factory;
+    use alloy_primitives::{address, b256, keccak256, U256};
+    use reth_db_api::{
+        models::StorageSettings,
+        tables,
+        transaction::{DbTx, DbTxMut},
+    };
+    use reth_primitives_traits::StorageEntry;
+    use reth_storage_api::StorageSettingsCache;
 
     const fn assert_state_provider<T: StateProvider>() {}
-    #[allow(dead_code)]
-    const fn assert_latest_state_provider<T: DbTx>() {
+    #[expect(dead_code)]
+    const fn assert_latest_state_provider<
+        T: DBProvider + BlockHashReader + StorageSettingsCache,
+    >() {
         assert_state_provider::<LatestStateProvider<T>>();
+    }
+
+    #[test]
+    fn test_latest_storage_hashed_state() {
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let address = address!("0x0000000000000000000000000000000000000001");
+        let slot = b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let hashed_address = keccak256(address);
+        let hashed_slot = keccak256(slot);
+
+        let tx = factory.provider_rw().unwrap().into_tx();
+        tx.put::<tables::HashedStorages>(
+            hashed_address,
+            StorageEntry { key: hashed_slot, value: U256::from(42) },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+
+        assert_eq!(provider_ref.storage(address, slot).unwrap(), Some(U256::from(42)));
+
+        let other_address = address!("0x0000000000000000000000000000000000000099");
+        let other_slot =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+        assert_eq!(provider_ref.storage(other_address, other_slot).unwrap(), None);
+
+        let tx = factory.provider_rw().unwrap().into_tx();
+        let plain_address = address!("0x0000000000000000000000000000000000000002");
+        let plain_slot =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        tx.put::<tables::PlainStorageState>(
+            plain_address,
+            StorageEntry { key: plain_slot, value: U256::from(99) },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+        assert_eq!(provider_ref.storage(plain_address, plain_slot).unwrap(), None);
+    }
+
+    #[test]
+    fn test_latest_storage_hashed_state_returns_none_for_missing() {
+        let factory = create_test_provider_factory();
+        factory.set_storage_settings_cache(StorageSettings::v2());
+
+        let address = address!("0x0000000000000000000000000000000000000001");
+        let slot = b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+        assert_eq!(provider_ref.storage(address, slot).unwrap(), None);
+    }
+
+    #[test]
+    fn test_latest_storage_legacy() {
+        let factory = create_test_provider_factory();
+        assert!(!factory.provider().unwrap().cached_storage_settings().use_hashed_state());
+
+        let address = address!("0x0000000000000000000000000000000000000001");
+        let slot = b256!("0x0000000000000000000000000000000000000000000000000000000000000005");
+
+        let tx = factory.provider_rw().unwrap().into_tx();
+        tx.put::<tables::PlainStorageState>(
+            address,
+            StorageEntry { key: slot, value: U256::from(42) },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+
+        assert_eq!(provider_ref.storage(address, slot).unwrap(), Some(U256::from(42)));
+
+        let other_slot =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+        assert_eq!(provider_ref.storage(address, other_slot).unwrap(), None);
+    }
+
+    #[test]
+    fn test_latest_storage_legacy_does_not_read_hashed() {
+        let factory = create_test_provider_factory();
+        assert!(!factory.provider().unwrap().cached_storage_settings().use_hashed_state());
+
+        let address = address!("0x0000000000000000000000000000000000000001");
+        let slot = b256!("0x0000000000000000000000000000000000000000000000000000000000000005");
+        let hashed_address = keccak256(address);
+        let hashed_slot = keccak256(slot);
+
+        let tx = factory.provider_rw().unwrap().into_tx();
+        tx.put::<tables::HashedStorages>(
+            hashed_address,
+            StorageEntry { key: hashed_slot, value: U256::from(42) },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let db = factory.provider().unwrap();
+        let provider_ref = LatestStateProviderRef::new(&db);
+        assert_eq!(provider_ref.storage(address, slot).unwrap(), None);
     }
 }

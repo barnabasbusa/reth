@@ -1,11 +1,10 @@
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Map, B256};
 use derive_more::{Deref, DerefMut};
 use reth_trie::prefix_set::PrefixSet;
-use std::collections::HashMap;
 
 /// Target accounts with corresponding prefix sets for storage root calculation.
 #[derive(Deref, DerefMut, Debug)]
-pub struct StorageRootTargets(HashMap<B256, PrefixSet>);
+pub struct StorageRootTargets(B256Map<PrefixSet>);
 
 impl StorageRootTargets {
     /// Create new storage root targets from updated post state accounts
@@ -24,6 +23,23 @@ impl StorageRootTargets {
                 .chain(storage_prefix_sets)
                 .collect(),
         )
+    }
+
+    /// Returns the total number of unique storage root targets without allocating new maps.
+    pub fn count(
+        account_prefix_set: &PrefixSet,
+        storage_prefix_sets: &B256Map<PrefixSet>,
+    ) -> usize {
+        let mut count = storage_prefix_sets.len();
+
+        for nibbles in account_prefix_set {
+            let hashed_address = B256::from_slice(&nibbles.pack());
+            if !storage_prefix_sets.contains_key(&hashed_address) {
+                count += 1;
+            }
+        }
+
+        count
     }
 }
 

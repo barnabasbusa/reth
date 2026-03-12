@@ -1,8 +1,8 @@
 //! Cursor wrapper for libmdbx-sys.
 
+use super::utils::*;
 use crate::{
     metrics::{DatabaseEnvMetrics, Operation},
-    tables::utils::*,
     DatabaseError,
 };
 use reth_db_api::{
@@ -11,7 +11,7 @@ use reth_db_api::{
         DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW, DupWalker, RangeWalker,
         ReverseWalker, Walker,
     },
-    table::{Compress, Decode, Decompress, DupSort, Encode, Table},
+    table::{Compress, Decode, Decompress, DupSort, Encode, IntoVec, Table},
 };
 use reth_libmdbx::{Error as MDBXError, TransactionKind, WriteFlags, RO, RW};
 use reth_storage_errors::db::{DatabaseErrorInfo, DatabaseWriteError, DatabaseWriteOperation};
@@ -62,7 +62,7 @@ impl<K: TransactionKind, T: Table> Cursor<K, T> {
 }
 
 /// Decodes a `(key, value)` pair from the database.
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 pub fn decode<T>(
     res: Result<Option<(Cow<'_, [u8]>, Cow<'_, [u8]>)>, impl Into<DatabaseErrorInfo>>,
 ) -> PairResult<T>
@@ -158,9 +158,23 @@ impl<K: TransactionKind, T: Table> DbCursorRO<T> for Cursor<K, T> {
 }
 
 impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
+    /// Returns the previous `(key, value)` pair of a DUPSORT table.
+    fn prev_dup(&mut self) -> PairResult<T> {
+        decode::<T>(self.inner.prev_dup())
+    }
+
     /// Returns the next `(key, value)` pair of a DUPSORT table.
     fn next_dup(&mut self) -> PairResult<T> {
         decode::<T>(self.inner.next_dup())
+    }
+
+    /// Returns the last `value` of the current duplicate `key`.
+    fn last_dup(&mut self) -> ValueOnlyResult<T> {
+        self.inner
+            .last_dup()
+            .map_err(|e| DatabaseError::Read(e.into()))?
+            .map(decode_one::<T>)
+            .transpose()
     }
 
     /// Returns the next `(key, value)` pair skipping the duplicates.
@@ -201,27 +215,26 @@ impl<K: TransactionKind, T: DupSort> DbDupCursorRO<T> for Cursor<K, T> {
     ) -> Result<DupWalker<'_, T, Self>, DatabaseError> {
         let start = match (key, subkey) {
             (Some(key), Some(subkey)) => {
-                // encode key and decode it after.
-                let key: Vec<u8> = key.encode().into();
+                let encoded_key = key.encode();
                 self.inner
-                    .get_both_range(key.as_ref(), subkey.encode().as_ref())
+                    .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
                     .map_err(|e| DatabaseError::Read(e.into()))?
-                    .map(|val| decoder::<T>((Cow::Owned(key), val)))
+                    .map(|val| decoder::<T>((Cow::Borrowed(encoded_key.as_ref()), val)))
             }
             (Some(key), None) => {
-                let key: Vec<u8> = key.encode().into();
+                let encoded_key = key.encode();
                 self.inner
-                    .set(key.as_ref())
+                    .set(encoded_key.as_ref())
                     .map_err(|e| DatabaseError::Read(e.into()))?
-                    .map(|val| decoder::<T>((Cow::Owned(key), val)))
+                    .map(|val| decoder::<T>((Cow::Borrowed(encoded_key.as_ref()), val)))
             }
             (None, Some(subkey)) => {
                 if let Some((key, _)) = self.first()? {
-                    let key: Vec<u8> = key.encode().into();
+                    let encoded_key = key.encode();
                     self.inner
-                        .get_both_range(key.as_ref(), subkey.encode().as_ref())
+                        .get_both_range(encoded_key.as_ref(), subkey.encode().as_ref())
                         .map_err(|e| DatabaseError::Read(e.into()))?
-                        .map(|val| decoder::<T>((Cow::Owned(key), val)))
+                        .map(|val| decoder::<T>((Cow::Borrowed(encoded_key.as_ref()), val)))
                 } else {
                     Some(Err(DatabaseError::Read(MDBXError::NotFound.into())))
                 }
@@ -241,7 +254,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
     /// it will append the value to the subkey, even if the subkeys are the same. So if you want
     /// to properly upsert, you'll need to `seek_exact` & `delete_current` if the key+subkey was
     /// found, before calling `upsert`.
-    fn upsert(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
+    fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
         let value = compress_to_buf_or_ref!(self, value);
         self.execute_with_operation_metric(
@@ -255,7 +268,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
                             info: e.into(),
                             operation: DatabaseWriteOperation::CursorUpsert,
                             table_name: T::NAME,
-                            key: key.into(),
+                            key: key.into_vec(),
                         }
                         .into()
                     })
@@ -263,7 +276,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
         )
     }
 
-    fn insert(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
+    fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
         let value = compress_to_buf_or_ref!(self, value);
         self.execute_with_operation_metric(
@@ -277,7 +290,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
                             info: e.into(),
                             operation: DatabaseWriteOperation::CursorInsert,
                             table_name: T::NAME,
-                            key: key.into(),
+                            key: key.into_vec(),
                         }
                         .into()
                     })
@@ -287,7 +300,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
 
     /// Appends the data to the end of the table. Consequently, the append operation
     /// will fail if the inserted key is less than the last table key
-    fn append(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError> {
+    fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError> {
         let key = key.encode();
         let value = compress_to_buf_or_ref!(self, value);
         self.execute_with_operation_metric(
@@ -301,7 +314,7 @@ impl<T: Table> DbCursorRW<T> for Cursor<RW, T> {
                             info: e.into(),
                             operation: DatabaseWriteOperation::CursorAppend,
                             table_name: T::NAME,
-                            key: key.into(),
+                            key: key.into_vec(),
                         }
                         .into()
                     })
@@ -337,11 +350,117 @@ impl<T: DupSort> DbDupCursorRW<T> for Cursor<RW, T> {
                             info: e.into(),
                             operation: DatabaseWriteOperation::CursorAppendDup,
                             table_name: T::NAME,
-                            key: key.into(),
+                            key: key.into_vec(),
                         }
                         .into()
                     })
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        mdbx::{DatabaseArguments, DatabaseEnv, DatabaseEnvKind},
+        tables::StorageChangeSets,
+        Database,
+    };
+    use alloy_primitives::{address, Address, B256, U256};
+    use reth_db_api::{
+        cursor::{DbCursorRO, DbDupCursorRW},
+        models::{BlockNumberAddress, ClientVersion},
+        table::TableImporter,
+        transaction::{DbTx, DbTxMut},
+    };
+    use reth_primitives_traits::StorageEntry;
+    use tempfile::TempDir;
+
+    fn create_test_db() -> DatabaseEnv {
+        let path = TempDir::new().unwrap();
+        let mut db = DatabaseEnv::open(
+            path.path(),
+            DatabaseEnvKind::RW,
+            DatabaseArguments::new(ClientVersion::default()),
+        )
+        .unwrap();
+        db.create_tables().unwrap();
+        db
+    }
+
+    #[test]
+    fn test_import_table_with_range_works_on_dupsort() {
+        let addr1 = address!("0000000000000000000000000000000000000001");
+        let addr2 = address!("0000000000000000000000000000000000000002");
+        let addr3 = address!("0000000000000000000000000000000000000003");
+        let source_db = create_test_db();
+        let target_db = create_test_db();
+        let test_data = vec![
+            (
+                BlockNumberAddress((100, addr1)),
+                StorageEntry { key: B256::with_last_byte(1), value: U256::from(100) },
+            ),
+            (
+                BlockNumberAddress((100, addr1)),
+                StorageEntry { key: B256::with_last_byte(2), value: U256::from(200) },
+            ),
+            (
+                BlockNumberAddress((100, addr1)),
+                StorageEntry { key: B256::with_last_byte(3), value: U256::from(300) },
+            ),
+            (
+                BlockNumberAddress((101, addr1)),
+                StorageEntry { key: B256::with_last_byte(1), value: U256::from(400) },
+            ),
+            (
+                BlockNumberAddress((101, addr2)),
+                StorageEntry { key: B256::with_last_byte(1), value: U256::from(500) },
+            ),
+            (
+                BlockNumberAddress((101, addr2)),
+                StorageEntry { key: B256::with_last_byte(2), value: U256::from(600) },
+            ),
+            (
+                BlockNumberAddress((102, addr3)),
+                StorageEntry { key: B256::with_last_byte(1), value: U256::from(700) },
+            ),
+        ];
+
+        // setup data
+        let tx = source_db.tx_mut().unwrap();
+        {
+            let mut cursor = tx.cursor_dup_write::<StorageChangeSets>().unwrap();
+            for (key, value) in &test_data {
+                cursor.append_dup(*key, *value).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        // import data from source db to target
+        let source_tx = source_db.tx().unwrap();
+        let target_tx = target_db.tx_mut().unwrap();
+
+        target_tx
+            .import_table_with_range::<StorageChangeSets, _>(
+                &source_tx,
+                Some(BlockNumberAddress((100, Address::ZERO))),
+                BlockNumberAddress((102, Address::repeat_byte(0xff))),
+            )
+            .unwrap();
+        target_tx.commit().unwrap();
+
+        // fetch all data from target db
+        let verify_tx = target_db.tx().unwrap();
+        let mut cursor = verify_tx.cursor_dup_read::<StorageChangeSets>().unwrap();
+        let copied: Vec<_> = cursor.walk(None).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+
+        // verify each entry matches the test data
+        assert_eq!(copied.len(), test_data.len(), "Should copy all entries including duplicates");
+        for ((copied_key, copied_value), (expected_key, expected_value)) in
+            copied.iter().zip(test_data.iter())
+        {
+            assert_eq!(copied_key, expected_key);
+            assert_eq!(copied_value, expected_value);
+        }
     }
 }

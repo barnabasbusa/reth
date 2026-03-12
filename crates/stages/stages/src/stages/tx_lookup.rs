@@ -1,15 +1,20 @@
+use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{TxHash, TxNumber};
 use num_traits::Zero;
 use reth_config::config::{EtlConfig, TransactionLookupConfig};
-use reth_db::{tables, RawKey, RawValue};
+#[cfg(all(unix, feature = "rocksdb"))]
+use reth_db_api::Tables;
 use reth_db_api::{
-    cursor::{DbCursorRO, DbCursorRW},
-    transaction::{DbTx, DbTxMut},
+    table::{Decode, Decompress, Value},
+    tables,
+    transaction::DbTxMut,
 };
 use reth_etl::Collector;
+use reth_primitives_traits::{NodePrimitives, SignedTransaction};
 use reth_provider::{
-    BlockReader, DBProvider, PruneCheckpointReader, PruneCheckpointWriter,
-    StaticFileProviderFactory, StatsReader, TransactionsProvider, TransactionsProviderExt,
+    BlockReader, DBProvider, EitherWriter, PruneCheckpointReader, PruneCheckpointWriter,
+    RocksDBProviderFactory, StaticFileProviderFactory, StatsReader, StorageSettingsCache,
+    TransactionsProvider, TransactionsProviderExt,
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment};
 use reth_stages_api::{
@@ -60,8 +65,10 @@ where
         + BlockReader
         + PruneCheckpointReader
         + StatsReader
-        + StaticFileProviderFactory
-        + TransactionsProviderExt,
+        + StaticFileProviderFactory<Primitives: NodePrimitives<SignedTx: Value + SignedTransaction>>
+        + TransactionsProviderExt
+        + StorageSettingsCache
+        + RocksDBProviderFactory,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -84,28 +91,27 @@ where
                 )
             })
             .transpose()?
-            .flatten()
+            .flatten() &&
+            target_prunable_block > input.checkpoint().block_number
         {
-            if target_prunable_block > input.checkpoint().block_number {
-                input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
+            input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
 
-                // Save prune checkpoint only if we don't have one already.
-                // Otherwise, pruner may skip the unpruned range of blocks.
-                if provider.get_prune_checkpoint(PruneSegment::TransactionLookup)?.is_none() {
-                    let target_prunable_tx_number = provider
-                        .block_body_indices(target_prunable_block)?
-                        .ok_or(ProviderError::BlockBodyIndicesNotFound(target_prunable_block))?
-                        .last_tx_num();
+            // Save prune checkpoint only if we don't have one already.
+            // Otherwise, pruner may skip the unpruned range of blocks.
+            if provider.get_prune_checkpoint(PruneSegment::TransactionLookup)?.is_none() {
+                let target_prunable_tx_number = provider
+                    .block_body_indices(target_prunable_block)?
+                    .ok_or(ProviderError::BlockBodyIndicesNotFound(target_prunable_block))?
+                    .last_tx_num();
 
-                    provider.save_prune_checkpoint(
-                        PruneSegment::TransactionLookup,
-                        PruneCheckpoint {
-                            block_number: Some(target_prunable_block),
-                            tx_number: Some(target_prunable_tx_number),
-                            prune_mode,
-                        },
-                    )?;
-                }
+                provider.save_prune_checkpoint(
+                    PruneSegment::TransactionLookup,
+                    PruneCheckpoint {
+                        block_number: Some(target_prunable_block),
+                        tx_number: Some(target_prunable_tx_number),
+                        prune_mode,
+                    },
+                )?;
             }
         }
         if input.target_reached() {
@@ -123,14 +129,21 @@ where
         );
 
         loop {
-            let (tx_range, block_range, is_final_range) =
-                input.next_block_range_with_transaction_threshold(provider, self.chunk_size)?;
+            let Some(range_output) =
+                input.next_block_range_with_transaction_threshold(provider, self.chunk_size)?
+            else {
+                input.checkpoint = Some(
+                    StageCheckpoint::new(input.target())
+                        .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
+                );
+                break;
+            };
 
-            let end_block = *block_range.end();
+            let end_block = *range_output.block_range.end();
 
-            info!(target: "sync::stages::transaction_lookup", ?tx_range, "Calculating transaction hashes");
+            info!(target: "sync::stages::transaction_lookup", tx_range = ?range_output.tx_range, "Calculating transaction hashes");
 
-            for (key, value) in provider.transaction_hashes_by_range(tx_range)? {
+            for (key, value) in provider.transaction_hashes_by_range(range_output.tx_range)? {
                 hash_collector.insert(key, value)?;
             }
 
@@ -139,33 +152,43 @@ where
                     .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
             );
 
-            if is_final_range {
-                let append_only =
-                    provider.count_entries::<tables::TransactionHashNumbers>()?.is_zero();
-                let mut txhash_cursor = provider
-                    .tx_ref()
-                    .cursor_write::<tables::RawTable<tables::TransactionHashNumbers>>()?;
-
+            if range_output.is_final_range {
                 let total_hashes = hash_collector.len();
                 let interval = (total_hashes / 10).max(1);
-                for (index, hash_to_number) in hash_collector.iter()?.enumerate() {
-                    let (hash, number) = hash_to_number?;
-                    if index > 0 && index % interval == 0 {
-                        info!(
-                            target: "sync::stages::transaction_lookup",
-                            ?append_only,
-                            progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
-                            "Inserting hashes"
-                        );
+
+                // Use append mode when table is empty (first sync) - significantly faster
+                let append_only =
+                    provider.count_entries::<tables::TransactionHashNumbers>()?.is_zero();
+
+                // Auto-commits on threshold; consistency check heals any crash.
+                provider.with_rocksdb_batch_auto_commit(|rocksdb_batch| {
+                    let mut writer =
+                        EitherWriter::new_transaction_hash_numbers(provider, rocksdb_batch)?;
+
+                    let iter = hash_collector
+                        .iter()
+                        .map_err(|e| ProviderError::other(Box::new(e)))?;
+
+                    for (index, hash_to_number) in iter.enumerate() {
+                        let (hash_bytes, number_bytes) =
+                            hash_to_number.map_err(|e| ProviderError::other(Box::new(e)))?;
+                        if index > 0 && index.is_multiple_of(interval) {
+                            info!(
+                                target: "sync::stages::transaction_lookup",
+                                ?append_only,
+                                progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
+                                "Inserting hashes"
+                            );
+                        }
+
+                        // Decode from raw ETL bytes
+                        let hash = TxHash::decode(&hash_bytes)?;
+                        let tx_num = TxNumber::decompress(&number_bytes)?;
+                        writer.put_transaction_hash_number(hash, tx_num, append_only)?;
                     }
 
-                    let key = RawKey::<TxHash>::from_vec(hash);
-                    if append_only {
-                        txhash_cursor.append(key, RawValue::<TxNumber>::from_vec(number))?
-                    } else {
-                        txhash_cursor.insert(key, RawValue::<TxNumber>::from_vec(number))?
-                    }
-                }
+                    Ok(((), writer.into_raw_rocksdb_batch()))
+                })?;
 
                 trace!(target: "sync::stages::transaction_lookup",
                     total_hashes,
@@ -174,6 +197,12 @@ where
 
                 break;
             }
+        }
+
+        #[cfg(all(unix, feature = "rocksdb"))]
+        if provider.cached_storage_settings().storage_v2 {
+            provider.commit_pending_rocksdb_batches()?;
+            provider.rocksdb_provider().flush(&[Tables::TransactionHashNumbers.name()])?;
         }
 
         Ok(ExecOutput {
@@ -189,29 +218,33 @@ where
         provider: &Provider,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        let tx = provider.tx_ref();
         let (range, unwind_to, _) = input.unwind_block_range_with_threshold(self.chunk_size);
 
-        // Cursors to unwind tx hash to number
-        let mut body_cursor = tx.cursor_read::<tables::BlockBodyIndices>()?;
-        let mut tx_hash_number_cursor = tx.cursor_write::<tables::TransactionHashNumbers>()?;
-        let static_file_provider = provider.static_file_provider();
-        let mut rev_walker = body_cursor.walk_back(Some(*range.end()))?;
-        while let Some((number, body)) = rev_walker.next().transpose()? {
-            if number <= unwind_to {
-                break;
-            }
+        provider.with_rocksdb_batch(|rocksdb_batch| {
+            let mut writer = EitherWriter::new_transaction_hash_numbers(provider, rocksdb_batch)?;
 
-            // Delete all transactions that belong to this block
-            for tx_id in body.tx_num_range() {
-                // First delete the transaction and hash to id mapping
-                if let Some(transaction) = static_file_provider.transaction_by_id(tx_id)? {
-                    if tx_hash_number_cursor.seek_exact(transaction.hash())?.is_some() {
-                        tx_hash_number_cursor.delete_current()?;
-                    }
+            let static_file_provider = provider.static_file_provider();
+            let rev_walker = provider
+                .block_body_indices_range(range.clone())?
+                .into_iter()
+                .rev()
+                .zip(range.rev());
+
+            for (body, number) in rev_walker {
+                if number <= unwind_to {
+                    break;
+                }
+
+                // Delete all transactions that belong to this block
+                for transaction in
+                    static_file_provider.transactions_by_tx_range(body.tx_num_range())?
+                {
+                    writer.delete_transaction_hash_number(transaction.trie_hash())?;
                 }
             }
-        }
+
+            Ok(((), writer.into_raw_rocksdb_batch()))
+        })?;
 
         Ok(UnwindOutput {
             checkpoint: StageCheckpoint::new(unwind_to)
@@ -252,9 +285,11 @@ mod tests {
     };
     use alloy_primitives::{BlockNumber, B256};
     use assert_matches::assert_matches;
-    use reth_primitives::SealedBlock;
+    use reth_db_api::{cursor::DbCursorRO, transaction::DbTx};
+    use reth_ethereum_primitives::Block;
+    use reth_primitives_traits::SealedBlock;
     use reth_provider::{
-        providers::StaticFileWriter, DatabaseProviderFactory, StaticFileProviderFactory,
+        providers::StaticFileWriter, BlockBodyIndicesProvider, DatabaseProviderFactory,
     };
     use reth_stages_api::StageUnitCheckpoint;
     use reth_testing_utils::generators::{
@@ -310,7 +345,7 @@ mod tests {
                     total
                 }))
             }, done: true }) if block_number == previous_stage && processed == total &&
-                total == runner.db.factory.static_file_provider().count_entries::<tables::Transactions>().unwrap() as u64
+                total == runner.db.count_entries::<tables::Transactions>().unwrap() as u64
         );
 
         // Validate the stage execution
@@ -356,7 +391,7 @@ mod tests {
                     total
                 }))
             }, done: true }) if block_number == previous_stage && processed == total &&
-                total == runner.db.factory.static_file_provider().count_entries::<tables::Transactions>().unwrap() as u64
+                total == runner.db.count_entries::<tables::Transactions>().unwrap() as u64
         );
 
         // Validate the stage execution
@@ -381,9 +416,9 @@ mod tests {
         let mut tx_hash_numbers = Vec::new();
         let mut tx_hash_number = 0;
         for block in &blocks[..=max_processed_block] {
-            for transaction in &block.body.transactions {
+            for transaction in &block.body().transactions {
                 if block.number > max_pruned_block {
-                    tx_hash_numbers.push((transaction.hash, tx_hash_number));
+                    tx_hash_numbers.push((*transaction.tx_hash(), tx_hash_number));
                 }
                 tx_hash_number += 1;
             }
@@ -399,7 +434,7 @@ mod tests {
                     tx_number: Some(
                         blocks[..=max_pruned_block as usize]
                             .iter()
-                            .map(|block| block.body.transactions.len() as u64)
+                            .map(|block| block.transaction_count() as u64)
                             .sum::<u64>()
                             .sub(1), // `TxNumber` is 0-indexed
                     ),
@@ -415,9 +450,9 @@ mod tests {
             EntitiesCheckpoint {
                 processed: blocks[..=max_processed_block]
                     .iter()
-                    .map(|block| block.body.transactions.len() as u64)
-                    .sum::<u64>(),
-                total: blocks.iter().map(|block| block.body.transactions.len() as u64).sum::<u64>()
+                    .map(|block| block.transaction_count() as u64)
+                    .sum(),
+                total: blocks.iter().map(|block| block.transaction_count() as u64).sum()
             }
         );
     }
@@ -449,7 +484,7 @@ mod tests {
         ///
         /// 1. If there are any entries in the [`tables::TransactionHashNumbers`] table above a
         ///    given block number.
-        /// 2. If the is no requested block entry in the bodies table, but
+        /// 2. If there is no requested block entry in the bodies table, but
         ///    [`tables::TransactionHashNumbers`] is    not empty.
         fn ensure_no_hash_by_block(&self, number: BlockNumber) -> Result<(), TestRunnerError> {
             let body_result = self
@@ -491,7 +526,7 @@ mod tests {
     }
 
     impl ExecuteStageTestRunner for TransactionLookupTestRunner {
-        type Seed = Vec<SealedBlock>;
+        type Seed = Vec<SealedBlock<Block>>;
 
         fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
             let stage_progress = input.checkpoint().block_number;
@@ -527,11 +562,10 @@ mod tests {
                         })
                         .transpose()
                         .expect("prune target block for transaction lookup")
-                        .flatten()
+                        .flatten() &&
+                        target_prunable_block > input.checkpoint().block_number
                     {
-                        if target_prunable_block > input.checkpoint().block_number {
-                            input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
-                        }
+                        input.checkpoint = Some(StageCheckpoint::new(target_prunable_block));
                     }
                     let start_block = input.next_block();
                     let end_block = output.checkpoint.block_number;
@@ -548,7 +582,10 @@ mod tests {
                         for tx_id in body.tx_num_range() {
                             let transaction =
                                 provider.transaction_by_id(tx_id)?.expect("no transaction entry");
-                            assert_eq!(Some(tx_id), provider.transaction_id(transaction.hash())?);
+                            assert_eq!(
+                                Some(tx_id),
+                                provider.transaction_id(*transaction.tx_hash())?
+                            );
                         }
                     }
                 }
@@ -561,6 +598,158 @@ mod tests {
     impl UnwindStageTestRunner for TransactionLookupTestRunner {
         fn validate_unwind(&self, input: UnwindInput) -> Result<(), TestRunnerError> {
             self.ensure_no_hash_by_block(input.unwind_to)
+        }
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    mod rocksdb_tests {
+        use super::*;
+        use reth_provider::RocksDBProviderFactory;
+        use reth_storage_api::StorageSettings;
+
+        /// Test that when `transaction_hash_numbers_in_rocksdb` is enabled, the stage
+        /// writes transaction hash mappings to `RocksDB` instead of MDBX.
+        #[tokio::test]
+        async fn execute_writes_to_rocksdb_when_enabled() {
+            let (previous_stage, stage_progress) = (110, 100);
+            let mut rng = generators::rng();
+
+            // Set up the runner
+            let runner = TransactionLookupTestRunner::default();
+
+            // Enable RocksDB for transaction hash numbers
+            runner.db.factory.set_storage_settings_cache(StorageSettings::v2());
+
+            let input = ExecInput {
+                target: Some(previous_stage),
+                checkpoint: Some(StageCheckpoint::new(stage_progress)),
+            };
+
+            // Insert blocks with transactions
+            let blocks = random_block_range(
+                &mut rng,
+                stage_progress + 1..=previous_stage,
+                BlockRangeParams {
+                    parent: Some(B256::ZERO),
+                    tx_count: 1..3, // Ensure we have transactions
+                    ..Default::default()
+                },
+            );
+            runner
+                .db
+                .insert_blocks(blocks.iter(), StorageKind::Static)
+                .expect("failed to insert blocks");
+
+            // Count expected transactions
+            let expected_tx_count: usize = blocks.iter().map(|b| b.body().transactions.len()).sum();
+            assert!(expected_tx_count > 0, "test requires at least one transaction");
+
+            // Execute the stage
+            let rx = runner.execute(input);
+            let result = rx.await.unwrap();
+            assert!(result.is_ok(), "stage execution failed: {:?}", result);
+
+            // Verify MDBX table is empty (data should be in RocksDB)
+            let mdbx_count = runner.db.count_entries::<tables::TransactionHashNumbers>().unwrap();
+            assert_eq!(
+                mdbx_count, 0,
+                "MDBX TransactionHashNumbers should be empty when RocksDB is enabled"
+            );
+
+            // Verify RocksDB has the data
+            let rocksdb = runner.db.factory.rocksdb_provider();
+            let mut rocksdb_count = 0;
+            for block in &blocks {
+                for tx in &block.body().transactions {
+                    let hash = *tx.tx_hash();
+                    let result = rocksdb.get::<tables::TransactionHashNumbers>(hash).unwrap();
+                    assert!(result.is_some(), "Transaction hash {:?} not found in RocksDB", hash);
+                    rocksdb_count += 1;
+                }
+            }
+            assert_eq!(
+                rocksdb_count, expected_tx_count,
+                "RocksDB should contain all transaction hashes"
+            );
+        }
+
+        /// Test that when `transaction_hash_numbers_in_rocksdb` is enabled, the stage
+        /// unwind deletes transaction hash mappings from `RocksDB` instead of MDBX.
+        #[tokio::test]
+        async fn unwind_deletes_from_rocksdb_when_enabled() {
+            let (previous_stage, stage_progress) = (110, 100);
+            let mut rng = generators::rng();
+
+            // Set up the runner
+            let runner = TransactionLookupTestRunner::default();
+
+            // Enable RocksDB for transaction hash numbers
+            runner.db.factory.set_storage_settings_cache(StorageSettings::v2());
+
+            // Insert blocks with transactions
+            let blocks = random_block_range(
+                &mut rng,
+                stage_progress + 1..=previous_stage,
+                BlockRangeParams {
+                    parent: Some(B256::ZERO),
+                    tx_count: 1..3, // Ensure we have transactions
+                    ..Default::default()
+                },
+            );
+            runner
+                .db
+                .insert_blocks(blocks.iter(), StorageKind::Static)
+                .expect("failed to insert blocks");
+
+            // Count expected transactions
+            let expected_tx_count: usize = blocks.iter().map(|b| b.body().transactions.len()).sum();
+            assert!(expected_tx_count > 0, "test requires at least one transaction");
+
+            // Execute the stage first to populate RocksDB
+            let exec_input = ExecInput {
+                target: Some(previous_stage),
+                checkpoint: Some(StageCheckpoint::new(stage_progress)),
+            };
+            let rx = runner.execute(exec_input);
+            let result = rx.await.unwrap();
+            assert!(result.is_ok(), "stage execution failed: {:?}", result);
+
+            // Verify RocksDB has the data before unwind
+            let rocksdb = runner.db.factory.rocksdb_provider();
+            for block in &blocks {
+                for tx in &block.body().transactions {
+                    let hash = *tx.tx_hash();
+                    let result = rocksdb.get::<tables::TransactionHashNumbers>(hash).unwrap();
+                    assert!(
+                        result.is_some(),
+                        "Transaction hash {:?} should exist before unwind",
+                        hash
+                    );
+                }
+            }
+
+            // Now unwind to stage_progress (removing all the blocks we added)
+            let unwind_input = UnwindInput {
+                checkpoint: StageCheckpoint::new(previous_stage),
+                unwind_to: stage_progress,
+                bad_block: None,
+            };
+            let unwind_result = runner.unwind(unwind_input).await;
+            assert!(unwind_result.is_ok(), "stage unwind failed: {:?}", unwind_result);
+
+            // Verify RocksDB data is deleted after unwind
+            let rocksdb = runner.db.factory.rocksdb_provider();
+            for block in &blocks {
+                for tx in &block.body().transactions {
+                    let hash = *tx.tx_hash();
+                    let result = rocksdb.get::<tables::TransactionHashNumbers>(hash).unwrap();
+                    assert!(
+                        result.is_none(),
+                        "Transaction hash {:?} should be deleted from RocksDB after unwind",
+                        hash
+                    );
+                }
+            }
         }
     }
 }

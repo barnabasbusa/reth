@@ -1,10 +1,10 @@
-use alloy_primitives::{Sealable, B256};
+use alloy_primitives::B256;
 use reth_chainspec::ChainSpec;
+use reth_ethereum_primitives::BlockBody;
 use reth_network_p2p::test_utils::TestFullBlockClient;
-use reth_primitives::{BlockBody, SealedHeader};
-use reth_provider::{
-    test_utils::{create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB},
-    ExecutionOutcome,
+use reth_primitives_traits::SealedHeader;
+use reth_provider::test_utils::{
+    create_test_provider_factory_with_chain_spec, MockNodeTypesWithDB,
 };
 use reth_prune_types::PruneModes;
 use reth_stages::{test_utils::TestStages, ExecOutput, StageError};
@@ -17,13 +17,12 @@ use tokio::sync::watch;
 #[derive(Default, Debug)]
 pub struct TestPipelineBuilder {
     pipeline_exec_outputs: VecDeque<Result<ExecOutput, StageError>>,
-    executor_results: Vec<ExecutionOutcome>,
 }
 
 impl TestPipelineBuilder {
     /// Create a new [`TestPipelineBuilder`].
     pub const fn new() -> Self {
-        Self { pipeline_exec_outputs: VecDeque::new(), executor_results: Vec::new() }
+        Self { pipeline_exec_outputs: VecDeque::new() }
     }
 
     /// Set the pipeline execution outputs to use for the test consensus engine.
@@ -36,9 +35,14 @@ impl TestPipelineBuilder {
     }
 
     /// Set the executor results to use for the test consensus engine.
-    #[allow(dead_code)]
-    pub fn with_executor_results(mut self, executor_results: Vec<ExecutionOutcome>) -> Self {
-        self.executor_results = executor_results;
+    #[deprecated(
+        note = "no-op: executor results are not used and will be removed in a future release"
+    )]
+    pub fn with_executor_results(
+        self,
+        executor_results: Vec<reth_provider::ExecutionOutcome>,
+    ) -> Self {
+        let _ = executor_results;
         self
     }
 
@@ -76,9 +80,7 @@ pub fn insert_headers_into_client(
         header.parent_hash = hash;
         header.number += 1;
         header.timestamp += 1;
-        let sealed = header.seal_slow();
-        let (header, seal) = sealed.into_parts();
-        sealed_header = SealedHeader::new(header, seal);
+        sealed_header = SealedHeader::seal_slow(header);
         client.insert(sealed_header.clone(), body.clone());
     }
 }

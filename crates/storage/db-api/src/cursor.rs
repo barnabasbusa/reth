@@ -21,7 +21,6 @@ pub trait DbCursorRO<T: Table> {
     fn seek(&mut self, key: T::Key) -> PairResult<T>;
 
     /// Position the cursor at the next KV pair, returning it.
-    #[allow(clippy::should_implement_trait)]
     fn next(&mut self) -> PairResult<T>;
 
     /// Position the cursor at the previous KV pair, returning it.
@@ -63,8 +62,14 @@ pub trait DbCursorRO<T: Table> {
 
 /// A read-only cursor over the dup table `T`.
 pub trait DbDupCursorRO<T: DupSort> {
+    /// Positions the cursor at the prev KV pair of the table, returning it.
+    fn prev_dup(&mut self) -> PairResult<T>;
+
     /// Positions the cursor at the next KV pair of the table, returning it.
     fn next_dup(&mut self) -> PairResult<T>;
+
+    /// Positions the cursor at the last duplicate value of the current key.
+    fn last_dup(&mut self) -> ValueOnlyResult<T>;
 
     /// Positions the cursor at the next KV pair of the table, skipping duplicates.
     fn next_no_dup(&mut self) -> PairResult<T>;
@@ -88,7 +93,7 @@ pub trait DbDupCursorRO<T: DupSort> {
     /// | `key`  | `subkey` | **Equivalent starting position**        |
     /// |--------|----------|-----------------------------------------|
     /// | `None` | `None`   | [`DbCursorRO::first()`]                 |
-    /// | `Some` | `None`   | [`DbCursorRO::seek()`]               |
+    /// | `Some` | `None`   | [`DbCursorRO::seek_exact()`]            |
     /// | `None` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     /// | `Some` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     fn walk_dup(
@@ -104,23 +109,23 @@ pub trait DbDupCursorRO<T: DupSort> {
 pub trait DbCursorRW<T: Table> {
     /// Database operation that will update an existing row if a specified value already
     /// exists in a table, and insert a new row if the specified value doesn't already exist
-    fn upsert(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError>;
+    fn upsert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
 
     /// Database operation that will insert a row at a given key. If the key is already
     /// present, the operation will result in an error.
-    fn insert(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError>;
+    fn insert(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
 
     /// Append value to next cursor item.
     ///
     /// This is efficient for pre-sorted data. If the data is not pre-sorted, use
     /// [`DbCursorRW::insert`].
-    fn append(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError>;
+    fn append(&mut self, key: T::Key, value: &T::Value) -> Result<(), DatabaseError>;
 
     /// Delete current value that cursor points to
     fn delete_current(&mut self) -> Result<(), DatabaseError>;
 }
 
-/// Read Write Cursor over `DupSorted` table.
+/// Read Write Cursor over `DupSort` table.
 pub trait DbDupCursorRW<T: DupSort> {
     /// Delete all duplicate entries for current key.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError>;
@@ -158,7 +163,7 @@ impl<T: Table, CURSOR: DbCursorRO<T>> Iterator for Walker<'_, T, CURSOR> {
 
 impl<'cursor, T: Table, CURSOR: DbCursorRO<T>> Walker<'cursor, T, CURSOR> {
     /// construct Walker
-    pub fn new(cursor: &'cursor mut CURSOR, start: IterPairResult<T>) -> Self {
+    pub const fn new(cursor: &'cursor mut CURSOR, start: IterPairResult<T>) -> Self {
         Self { cursor, start }
     }
 
@@ -201,7 +206,7 @@ where
 
 impl<'cursor, T: Table, CURSOR: DbCursorRO<T>> ReverseWalker<'cursor, T, CURSOR> {
     /// construct `ReverseWalker`
-    pub fn new(cursor: &'cursor mut CURSOR, start: IterPairResult<T>) -> Self {
+    pub const fn new(cursor: &'cursor mut CURSOR, start: IterPairResult<T>) -> Self {
         Self { cursor, start }
     }
 
@@ -316,6 +321,14 @@ impl<T: Table, CURSOR: DbCursorRW<T> + DbCursorRO<T>> RangeWalker<'_, T, CURSOR>
     pub fn delete_current(&mut self) -> Result<(), DatabaseError> {
         self.start.take();
         self.cursor.delete_current()
+    }
+}
+
+impl<T: DupSort, CURSOR: DbDupCursorRW<T> + DbCursorRO<T>> RangeWalker<'_, T, CURSOR> {
+    /// Delete all duplicate entries for current key that walker points to.
+    pub fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
+        self.start.take();
+        self.cursor.delete_current_duplicates()
     }
 }
 

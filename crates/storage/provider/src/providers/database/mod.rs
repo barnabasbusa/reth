@@ -1,94 +1,170 @@
 use crate::{
-    providers::{state::latest::LatestStateProvider, StaticFileProvider},
+    providers::{
+        state::latest::LatestStateProvider, NodeTypesForProvider, RocksDBProvider,
+        StaticFileProvider, StaticFileProviderRWRefMut,
+    },
     to_range,
     traits::{BlockSource, ReceiptProvider},
     BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory,
-    EvmEnvProvider, HeaderProvider, HeaderSyncGap, HeaderSyncGapProvider, ProviderError,
-    PruneCheckpointReader, StageCheckpointReader, StateProviderBox, StaticFileProviderFactory,
-    TransactionVariant, TransactionsProvider, WithdrawalsProvider,
+    EitherWriterDestination, HashedPostStateProvider, HeaderProvider, HeaderSyncGapProvider,
+    MetadataProvider, ProviderError, PruneCheckpointReader, RocksDBProviderFactory,
+    StageCheckpointReader, StateProviderBox, StaticFileProviderFactory, StaticFileWriter,
+    TransactionVariant, TransactionsProvider,
 };
+use alloy_consensus::transaction::TransactionMeta;
 use alloy_eips::BlockHashOrNumber;
-use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
+use alloy_primitives::{Address, BlockHash, BlockNumber, TxHash, TxNumber, B256};
 use core::fmt;
-use reth_chainspec::{ChainInfo, EthereumHardforks};
+use parking_lot::RwLock;
+use reth_chainspec::ChainInfo;
 use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
 use reth_db_api::{database::Database, models::StoredBlockBodyIndices};
 use reth_errors::{RethError, RethResult};
-use reth_evm::ConfigureEvmEnv;
-use reth_node_types::NodeTypesWithDB;
-use reth_primitives::{
-    Block, BlockWithSenders, Header, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    StaticFileSegment, TransactionMeta, TransactionSigned, TransactionSignedNoHash, Withdrawal,
-    Withdrawals,
+use reth_node_types::{
+    BlockTy, HeaderTy, NodeTypesWithDB, NodeTypesWithDBAdapter, ReceiptTy, TxTy,
 };
+use reth_primitives_traits::{RecoveredBlock, SealedHeader};
 use reth_prune_types::{PruneCheckpoint, PruneModes, PruneSegment};
-use reth_stages_types::{StageCheckpoint, StageId};
-use reth_storage_api::TryIntoHistoricalStateProvider;
+use reth_stages_types::{PipelineTarget, StageCheckpoint, StageId};
+use reth_static_file_types::StaticFileSegment;
+use reth_storage_api::{
+    BlockBodyIndicesProvider, NodePrimitivesProvider, StorageSettings, StorageSettingsCache,
+    TryIntoHistoricalStateProvider,
+};
 use reth_storage_errors::provider::ProviderResult;
-use revm::primitives::{BlockEnv, CfgEnvWithHandlerCfg};
+use reth_trie::HashedPostState;
+use reth_trie_db::ChangesetCache;
+use revm_database::BundleState;
 use std::{
     ops::{RangeBounds, RangeInclusive},
     path::Path,
     sync::Arc,
 };
-use tokio::sync::watch;
-use tracing::trace;
+use tracing::{instrument, trace};
 
 mod provider;
-pub use provider::{DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW};
+pub use provider::{
+    CommitOrder, DatabaseProvider, DatabaseProviderRO, DatabaseProviderRW, SaveBlocksMode,
+};
 
 use super::ProviderNodeTypes;
+use reth_trie::KeccakKeyHasher;
+
+mod builder;
+pub use builder::{ProviderFactoryBuilder, ReadOnlyConfig};
 
 mod metrics;
+
+mod chain;
+pub use chain::*;
 
 /// A common provider that fetches data from a database or static file.
 ///
 /// This provider implements most provider or provider factory traits.
 pub struct ProviderFactory<N: NodeTypesWithDB> {
-    /// Database
+    /// Database instance
     db: N::DB,
     /// Chain spec
     chain_spec: Arc<N::ChainSpec>,
     /// Static File Provider
-    static_file_provider: StaticFileProvider,
+    static_file_provider: StaticFileProvider<N::Primitives>,
     /// Optional pruning configuration
     prune_modes: PruneModes,
+    /// The node storage handler.
+    storage: Arc<N::Storage>,
+    /// Storage configuration settings for this node
+    storage_settings: Arc<RwLock<StorageSettings>>,
+    /// `RocksDB` provider
+    rocksdb_provider: RocksDBProvider,
+    /// Changeset cache for trie unwinding
+    changeset_cache: ChangesetCache,
+    /// Task runtime for spawning parallel I/O work.
+    runtime: reth_tasks::Runtime,
 }
 
-impl<N> fmt::Debug for ProviderFactory<N>
-where
-    N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug>,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self { db, chain_spec, static_file_provider, prune_modes } = self;
-        f.debug_struct("ProviderFactory")
-            .field("db", &db)
-            .field("chain_spec", &chain_spec)
-            .field("static_file_provider", &static_file_provider)
-            .field("prune_modes", &prune_modes)
-            .finish()
+impl<N: NodeTypesForProvider> ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>> {
+    /// Instantiates the builder for this type
+    pub fn builder() -> ProviderFactoryBuilder<N> {
+        ProviderFactoryBuilder::default()
+    }
+}
+
+impl<N: ProviderNodeTypes> ProviderFactory<N> {
+    /// Create new database provider factory.
+    ///
+    /// The storage backends used by the produced factory MAY be inconsistent.
+    /// It is recommended to call [`Self::check_consistency`] after
+    /// creation to ensure consistency between the database and static files.
+    /// If the function returns unwind targets, the caller MUST unwind the
+    /// inner database to the minimum of the two targets to ensure consistency.
+    pub fn new(
+        db: N::DB,
+        chain_spec: Arc<N::ChainSpec>,
+        static_file_provider: StaticFileProvider<N::Primitives>,
+        rocksdb_provider: RocksDBProvider,
+        runtime: reth_tasks::Runtime,
+    ) -> ProviderResult<Self> {
+        // Load storage settings from database at init time. Creates a temporary provider
+        // to read persisted settings, falling back to legacy defaults if none exist.
+        //
+        // Both factory and all providers it creates should share these cached settings.
+        let legacy_settings = StorageSettings::v1();
+        let storage_settings = DatabaseProvider::<_, N>::new(
+            db.tx()?,
+            chain_spec.clone(),
+            static_file_provider.clone(),
+            Default::default(),
+            Default::default(),
+            Arc::new(RwLock::new(legacy_settings)),
+            rocksdb_provider.clone(),
+            ChangesetCache::new(),
+            runtime.clone(),
+            db.path(),
+        )
+        .storage_settings()?
+        .unwrap_or(legacy_settings);
+
+        Ok(Self {
+            db,
+            chain_spec,
+            static_file_provider,
+            prune_modes: PruneModes::default(),
+            storage: Default::default(),
+            storage_settings: Arc::new(RwLock::new(storage_settings)),
+            rocksdb_provider,
+            changeset_cache: ChangesetCache::new(),
+            runtime,
+        })
+    }
+
+    /// Create new database provider factory and perform consistency checks.
+    ///
+    /// This will call [`Self::check_consistency`] internally and return
+    /// [`ProviderError::MustUnwind`] if inconsistencies are found. It may also
+    /// return any [`ProviderError`] that [`Self::new`] may return, or that are
+    /// encountered during consistency checks.
+    pub fn new_checked(
+        db: N::DB,
+        chain_spec: Arc<N::ChainSpec>,
+        static_file_provider: StaticFileProvider<N::Primitives>,
+        rocksdb_provider: RocksDBProvider,
+        runtime: reth_tasks::Runtime,
+    ) -> ProviderResult<Self> {
+        Self::new(db, chain_spec, static_file_provider, rocksdb_provider, runtime)
+            .and_then(Self::assert_consistent)
     }
 }
 
 impl<N: NodeTypesWithDB> ProviderFactory<N> {
-    /// Create new database provider factory.
-    pub fn new(
-        db: N::DB,
-        chain_spec: Arc<N::ChainSpec>,
-        static_file_provider: StaticFileProvider,
-    ) -> Self {
-        Self { db, chain_spec, static_file_provider, prune_modes: PruneModes::none() }
-    }
-
-    /// Enables metrics on the static file provider.
-    pub fn with_static_files_metrics(mut self) -> Self {
-        self.static_file_provider = self.static_file_provider.with_metrics();
-        self
-    }
-
     /// Sets the pruning configuration for an existing [`ProviderFactory`].
     pub fn with_prune_modes(mut self, prune_modes: PruneModes) -> Self {
         self.prune_modes = prune_modes;
+        self
+    }
+
+    /// Sets the changeset cache for an existing [`ProviderFactory`].
+    pub fn with_changeset_cache(mut self, changeset_cache: ChangesetCache) -> Self {
+        self.changeset_cache = changeset_cache;
         self
     }
 
@@ -104,21 +180,51 @@ impl<N: NodeTypesWithDB> ProviderFactory<N> {
     }
 }
 
-impl<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>> ProviderFactory<N> {
+impl<N: NodeTypesWithDB> StorageSettingsCache for ProviderFactory<N> {
+    fn cached_storage_settings(&self) -> StorageSettings {
+        *self.storage_settings.read()
+    }
+
+    fn set_storage_settings_cache(&self, settings: StorageSettings) {
+        *self.storage_settings.write() = settings;
+    }
+}
+
+impl<N: NodeTypesWithDB> RocksDBProviderFactory for ProviderFactory<N> {
+    fn rocksdb_provider(&self) -> RocksDBProvider {
+        self.rocksdb_provider.clone()
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn set_pending_rocksdb_batch(&self, _batch: rocksdb::WriteBatchWithTransaction<true>) {
+        unimplemented!("ProviderFactory is a factory, not a provider - use DatabaseProvider::set_pending_rocksdb_batch instead")
+    }
+
+    #[cfg(all(unix, feature = "rocksdb"))]
+    fn commit_pending_rocksdb_batches(&self) -> ProviderResult<()> {
+        unimplemented!("ProviderFactory is a factory, not a provider - use DatabaseProvider::commit_pending_rocksdb_batches instead")
+    }
+}
+
+impl<N: ProviderNodeTypes<DB = DatabaseEnv>> ProviderFactory<N> {
     /// Create new database provider by passing a path. [`ProviderFactory`] will own the database
     /// instance.
     pub fn new_with_database_path<P: AsRef<Path>>(
         path: P,
         chain_spec: Arc<N::ChainSpec>,
         args: DatabaseArguments,
-        static_file_provider: StaticFileProvider,
+        static_file_provider: StaticFileProvider<N::Primitives>,
+        rocksdb_provider: RocksDBProvider,
+        runtime: reth_tasks::Runtime,
     ) -> RethResult<Self> {
-        Ok(Self {
-            db: Arc::new(init_db(path, args).map_err(RethError::msg)?),
+        Self::new(
+            init_db(path, args).map_err(RethError::msg)?,
             chain_spec,
             static_file_provider,
-            prune_modes: PruneModes::none(),
-        })
+            rocksdb_provider,
+            runtime,
+        )
+        .map_err(RethError::Provider)
     }
 }
 
@@ -130,12 +236,18 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// This sets the [`PruneModes`] to [`None`], because they should only be relevant for writing
     /// data.
     #[track_caller]
-    pub fn provider(&self) -> ProviderResult<DatabaseProviderRO<N::DB, N::ChainSpec>> {
+    pub fn provider(&self) -> ProviderResult<DatabaseProviderRO<N::DB, N>> {
         Ok(DatabaseProvider::new(
             self.db.tx()?,
             self.chain_spec.clone(),
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
+            self.storage.clone(),
+            self.storage_settings.clone(),
+            self.rocksdb_provider.clone(),
+            self.changeset_cache.clone(),
+            self.runtime.clone(),
+            self.db.path(),
         ))
     }
 
@@ -144,20 +256,47 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
     /// [`BlockHashReader`].  This may fail if the inner read/write database transaction fails to
     /// open.
     #[track_caller]
-    pub fn provider_rw(&self) -> ProviderResult<DatabaseProviderRW<N::DB, N::ChainSpec>> {
+    pub fn provider_rw(&self) -> ProviderResult<DatabaseProviderRW<N::DB, N>> {
         Ok(DatabaseProviderRW(DatabaseProvider::new_rw(
             self.db.tx_mut()?,
             self.chain_spec.clone(),
             self.static_file_provider.clone(),
             self.prune_modes.clone(),
+            self.storage.clone(),
+            self.storage_settings.clone(),
+            self.rocksdb_provider.clone(),
+            self.changeset_cache.clone(),
+            self.runtime.clone(),
+            self.db.path(),
         )))
+    }
+
+    /// Returns a provider with a created `DbTxMut` inside, configured for unwind operations.
+    /// Uses unwind commit order (MDBX first, then `RocksDB`, then static files) to allow
+    /// recovery by truncating static files on restart if interrupted.
+    #[track_caller]
+    pub fn unwind_provider_rw(
+        &self,
+    ) -> ProviderResult<DatabaseProvider<<N::DB as Database>::TXMut, N>> {
+        Ok(DatabaseProvider::new_unwind_rw(
+            self.db.tx_mut()?,
+            self.chain_spec.clone(),
+            self.static_file_provider.clone(),
+            self.prune_modes.clone(),
+            self.storage.clone(),
+            self.storage_settings.clone(),
+            self.rocksdb_provider.clone(),
+            self.changeset_cache.clone(),
+            self.runtime.clone(),
+            self.db.path(),
+        ))
     }
 
     /// State provider for latest block
     #[track_caller]
     pub fn latest(&self) -> ProviderResult<StateProviderBox> {
         trace!(target: "providers::db", "Returning latest state provider");
-        Ok(Box::new(LatestStateProvider::new(self.db.tx()?, self.static_file_provider())))
+        Ok(Box::new(LatestStateProvider::new(self.database_provider_ro()?)))
     }
 
     /// Storage provider for state at that given block
@@ -178,16 +317,68 @@ impl<N: ProviderNodeTypes> ProviderFactory<N> {
             .block_number(block_hash)?
             .ok_or(ProviderError::BlockHashNotFound(block_hash))?;
 
-        let state_provider = self.provider()?.try_into_history_at_block(block_number)?;
+        let state_provider = provider.try_into_history_at_block(block_number)?;
         trace!(target: "providers::db", ?block_number, %block_hash, "Returning historical state provider for block hash");
         Ok(state_provider)
     }
+
+    /// Asserts that the static files and database are consistent. If not,
+    /// returns [`ProviderError::MustUnwind`] with the appropriate unwind
+    /// target. May also return any [`ProviderError`] that
+    /// [`Self::check_consistency`] may return.
+    pub fn assert_consistent(self) -> ProviderResult<Self> {
+        let (rocksdb_unwind, static_file_unwind) = self.check_consistency()?;
+
+        let source = match (rocksdb_unwind, static_file_unwind) {
+            (None, None) => return Ok(self),
+            (Some(_), Some(_)) => "RocksDB and Static Files",
+            (Some(_), None) => "RocksDB",
+            (None, Some(_)) => "Static Files",
+        };
+
+        Err(ProviderError::MustUnwind {
+            data_source: source,
+            unwind_to: rocksdb_unwind
+                .into_iter()
+                .chain(static_file_unwind)
+                .min()
+                .expect("at least one unwind target must be Some"),
+        })
+    }
+
+    /// Checks the consistency between the static files and the database. This
+    /// may result in static files being pruned or otherwise healed to ensure
+    /// consistency. I.e. this MAY result in writes to the static files.
+    #[instrument(err, skip(self))]
+    pub fn check_consistency(&self) -> ProviderResult<(Option<u64>, Option<u64>)> {
+        let provider_ro = self.database_provider_ro()?;
+
+        // Step 1: heal file-level inconsistencies (no pruning)
+        self.static_file_provider().check_file_consistency(&provider_ro)?;
+
+        // Step 2: RocksDB consistency check (needs static files tx data)
+        let rocksdb_unwind = self.rocksdb_provider().check_consistency(&provider_ro)?;
+
+        // Step 3: Static file checkpoint consistency (may prune)
+        let static_file_unwind = self.static_file_provider().check_consistency(&provider_ro)?.map(
+            |target| match target {
+                PipelineTarget::Unwind(block) => block,
+                PipelineTarget::Sync(_) => unreachable!("check_consistency returns Unwind"),
+            },
+        );
+
+        Ok((rocksdb_unwind, static_file_unwind))
+    }
+}
+
+impl<N: NodeTypesWithDB> NodePrimitivesProvider for ProviderFactory<N> {
+    type Primitives = N::Primitives;
 }
 
 impl<N: ProviderNodeTypes> DatabaseProviderFactory for ProviderFactory<N> {
     type DB = N::DB;
-    type Provider = DatabaseProvider<<N::DB as Database>::TX, N::ChainSpec>;
-    type ProviderRW = DatabaseProvider<<N::DB as Database>::TXMut, N::ChainSpec>;
+    type Provider = DatabaseProvider<<N::DB as Database>::TX, N>;
+    type ProviderRW = DatabaseProvider<<N::DB as Database>::TXMut, N>;
 
     fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
         self.provider()
@@ -200,103 +391,73 @@ impl<N: ProviderNodeTypes> DatabaseProviderFactory for ProviderFactory<N> {
 
 impl<N: NodeTypesWithDB> StaticFileProviderFactory for ProviderFactory<N> {
     /// Returns static file provider
-    fn static_file_provider(&self) -> StaticFileProvider {
+    fn static_file_provider(&self) -> StaticFileProvider<Self::Primitives> {
         self.static_file_provider.clone()
+    }
+
+    fn get_static_file_writer(
+        &self,
+        block: BlockNumber,
+        segment: StaticFileSegment,
+    ) -> ProviderResult<StaticFileProviderRWRefMut<'_, Self::Primitives>> {
+        self.static_file_provider.get_writer(block, segment)
     }
 }
 
 impl<N: ProviderNodeTypes> HeaderSyncGapProvider for ProviderFactory<N> {
-    fn sync_gap(
+    type Header = HeaderTy<N>;
+    fn local_tip_header(
         &self,
-        tip: watch::Receiver<B256>,
         highest_uninterrupted_block: BlockNumber,
-    ) -> ProviderResult<HeaderSyncGap> {
-        self.provider()?.sync_gap(tip, highest_uninterrupted_block)
+    ) -> ProviderResult<SealedHeader<Self::Header>> {
+        self.provider()?.local_tip_header(highest_uninterrupted_block)
     }
 }
 
 impl<N: ProviderNodeTypes> HeaderProvider for ProviderFactory<N> {
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+    type Header = HeaderTy<N>;
+
+    fn header(&self, block_hash: BlockHash) -> ProviderResult<Option<Self::Header>> {
         self.provider()?.header(block_hash)
     }
 
-    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Header>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            num,
-            |static_file| static_file.header_by_number(num),
-            || self.provider()?.header_by_number(num),
-        )
+    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
+        self.static_file_provider.header_by_number(num)
     }
 
-    fn header_td(&self, hash: &BlockHash) -> ProviderResult<Option<U256>> {
-        self.provider()?.header_td(hash)
+    fn headers_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<Self::Header>> {
+        self.static_file_provider.headers_range(range)
     }
 
-    fn header_td_by_number(&self, number: BlockNumber) -> ProviderResult<Option<U256>> {
-        if let Some(td) = self.chain_spec.final_paris_total_difficulty(number) {
-            // if this block is higher than the final paris(merge) block, return the final paris
-            // difficulty
-            return Ok(Some(td))
-        }
-
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            number,
-            |static_file| static_file.header_td_by_number(number),
-            || self.provider()?.header_td_by_number(number),
-        )
-    }
-
-    fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> ProviderResult<Vec<Header>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, _| static_file.headers_range(range),
-            |range, _| self.provider()?.headers_range(range),
-            |_| true,
-        )
-    }
-
-    fn sealed_header(&self, number: BlockNumber) -> ProviderResult<Option<SealedHeader>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            number,
-            |static_file| static_file.sealed_header(number),
-            || self.provider()?.sealed_header(number),
-        )
+    fn sealed_header(
+        &self,
+        number: BlockNumber,
+    ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
+        self.static_file_provider.sealed_header(number)
     }
 
     fn sealed_headers_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
-    ) -> ProviderResult<Vec<SealedHeader>> {
-        self.sealed_headers_while(range, |_| true)
+    ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
+        self.static_file_provider.sealed_headers_range(range)
     }
 
     fn sealed_headers_while(
         &self,
         range: impl RangeBounds<BlockNumber>,
-        predicate: impl FnMut(&SealedHeader) -> bool,
-    ) -> ProviderResult<Vec<SealedHeader>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            to_range(range),
-            |static_file, range, predicate| static_file.sealed_headers_while(range, predicate),
-            |range, predicate| self.provider()?.sealed_headers_while(range, predicate),
-            predicate,
-        )
+        predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
+    ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
+        self.static_file_provider.sealed_headers_while(range, predicate)
     }
 }
 
 impl<N: ProviderNodeTypes> BlockHashReader for ProviderFactory<N> {
     fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            number,
-            |static_file| static_file.block_hash(number),
-            || self.provider()?.block_hash(number),
-        )
+        self.static_file_provider.block_hash(number)
     }
 
     fn canonical_hashes_range(
@@ -304,13 +465,7 @@ impl<N: ProviderNodeTypes> BlockHashReader for ProviderFactory<N> {
         start: BlockNumber,
         end: BlockNumber,
     ) -> ProviderResult<Vec<B256>> {
-        self.static_file_provider.get_range_with_static_file_or_database(
-            StaticFileSegment::Headers,
-            start..end,
-            |static_file, range, _| static_file.canonical_hashes_range(range.start, range.end),
-            |range, _| self.provider()?.canonical_hashes_range(range.start, range.end),
-            |_| true,
-        )
+        self.static_file_provider.canonical_hashes_range(start, end)
     }
 }
 
@@ -324,7 +479,13 @@ impl<N: ProviderNodeTypes> BlockNumReader for ProviderFactory<N> {
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
-        self.provider()?.last_block_number()
+        self.static_file_provider.last_block_number()
+    }
+
+    fn earliest_block_number(&self) -> ProviderResult<BlockNumber> {
+        // earliest history height tracks the lowest block number that has __not__ been expired, in
+        // other words, the first/earliest available block.
+        Ok(self.static_file_provider.earliest_history_height())
     }
 
     fn block_number(&self, hash: B256) -> ProviderResult<Option<BlockNumber>> {
@@ -333,148 +494,143 @@ impl<N: ProviderNodeTypes> BlockNumReader for ProviderFactory<N> {
 }
 
 impl<N: ProviderNodeTypes> BlockReader for ProviderFactory<N> {
-    fn find_block_by_hash(&self, hash: B256, source: BlockSource) -> ProviderResult<Option<Block>> {
+    type Block = BlockTy<N>;
+
+    fn find_block_by_hash(
+        &self,
+        hash: B256,
+        source: BlockSource,
+    ) -> ProviderResult<Option<Self::Block>> {
         self.provider()?.find_block_by_hash(hash, source)
     }
 
-    fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Block>> {
+    fn block(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
         self.provider()?.block(id)
     }
 
-    fn pending_block(&self) -> ProviderResult<Option<SealedBlock>> {
+    fn pending_block(&self) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         self.provider()?.pending_block()
     }
 
-    fn pending_block_with_senders(&self) -> ProviderResult<Option<SealedBlockWithSenders>> {
-        self.provider()?.pending_block_with_senders()
-    }
-
-    fn pending_block_and_receipts(&self) -> ProviderResult<Option<(SealedBlock, Vec<Receipt>)>> {
+    fn pending_block_and_receipts(
+        &self,
+    ) -> ProviderResult<Option<(RecoveredBlock<Self::Block>, Vec<Self::Receipt>)>> {
         self.provider()?.pending_block_and_receipts()
     }
 
-    fn ommers(&self, id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Header>>> {
-        self.provider()?.ommers(id)
-    }
-
-    fn block_body_indices(
-        &self,
-        number: BlockNumber,
-    ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
-        self.provider()?.block_body_indices(number)
-    }
-
-    fn block_with_senders(
+    fn recovered_block(
         &self,
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
-    ) -> ProviderResult<Option<BlockWithSenders>> {
-        self.provider()?.block_with_senders(id, transaction_kind)
+    ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
+        self.provider()?.recovered_block(id, transaction_kind)
     }
 
     fn sealed_block_with_senders(
         &self,
         id: BlockHashOrNumber,
         transaction_kind: TransactionVariant,
-    ) -> ProviderResult<Option<SealedBlockWithSenders>> {
+    ) -> ProviderResult<Option<RecoveredBlock<Self::Block>>> {
         self.provider()?.sealed_block_with_senders(id, transaction_kind)
     }
 
-    fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
+    fn block_range(&self, range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
         self.provider()?.block_range(range)
     }
 
     fn block_with_senders_range(
         &self,
         range: RangeInclusive<BlockNumber>,
-    ) -> ProviderResult<Vec<BlockWithSenders>> {
+    ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
         self.provider()?.block_with_senders_range(range)
     }
 
-    fn sealed_block_with_senders_range(
+    fn recovered_block_range(
         &self,
         range: RangeInclusive<BlockNumber>,
-    ) -> ProviderResult<Vec<SealedBlockWithSenders>> {
-        self.provider()?.sealed_block_with_senders_range(range)
+    ) -> ProviderResult<Vec<RecoveredBlock<Self::Block>>> {
+        self.provider()?.recovered_block_range(range)
+    }
+
+    fn block_by_transaction_id(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
+        self.provider()?.block_by_transaction_id(id)
     }
 }
 
 impl<N: ProviderNodeTypes> TransactionsProvider for ProviderFactory<N> {
+    type Transaction = TxTy<N>;
+
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
         self.provider()?.transaction_id(tx_hash)
     }
 
-    fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<TransactionSigned>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Transactions,
-            id,
-            |static_file| static_file.transaction_by_id(id),
-            || self.provider()?.transaction_by_id(id),
-        )
+    fn transaction_by_id(&self, id: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
+        self.static_file_provider.transaction_by_id(id)
     }
 
-    fn transaction_by_id_no_hash(
+    fn transaction_by_id_unhashed(
         &self,
         id: TxNumber,
-    ) -> ProviderResult<Option<TransactionSignedNoHash>> {
-        self.static_file_provider.get_with_static_file_or_database(
-            StaticFileSegment::Transactions,
-            id,
-            |static_file| static_file.transaction_by_id_no_hash(id),
-            || self.provider()?.transaction_by_id_no_hash(id),
-        )
+    ) -> ProviderResult<Option<Self::Transaction>> {
+        self.static_file_provider.transaction_by_id_unhashed(id)
     }
 
-    fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<TransactionSigned>> {
+    fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
         self.provider()?.transaction_by_hash(hash)
     }
 
     fn transaction_by_hash_with_meta(
         &self,
         tx_hash: TxHash,
-    ) -> ProviderResult<Option<(TransactionSigned, TransactionMeta)>> {
+    ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
         self.provider()?.transaction_by_hash_with_meta(tx_hash)
-    }
-
-    fn transaction_block(&self, id: TxNumber) -> ProviderResult<Option<BlockNumber>> {
-        self.provider()?.transaction_block(id)
     }
 
     fn transactions_by_block(
         &self,
         id: BlockHashOrNumber,
-    ) -> ProviderResult<Option<Vec<TransactionSigned>>> {
+    ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
         self.provider()?.transactions_by_block(id)
     }
 
     fn transactions_by_block_range(
         &self,
         range: impl RangeBounds<BlockNumber>,
-    ) -> ProviderResult<Vec<Vec<TransactionSigned>>> {
+    ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
         self.provider()?.transactions_by_block_range(range)
     }
 
     fn transactions_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
-    ) -> ProviderResult<Vec<TransactionSignedNoHash>> {
-        self.provider()?.transactions_by_tx_range(range)
+    ) -> ProviderResult<Vec<Self::Transaction>> {
+        self.static_file_provider.transactions_by_tx_range(range)
     }
 
     fn senders_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Address>> {
-        self.provider()?.senders_by_tx_range(range)
+        if EitherWriterDestination::senders(self).is_static_file() {
+            self.static_file_provider.senders_by_tx_range(range)
+        } else {
+            self.provider()?.senders_by_tx_range(range)
+        }
     }
 
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
-        self.provider()?.transaction_sender(id)
+        if EitherWriterDestination::senders(self).is_static_file() {
+            self.static_file_provider.transaction_sender(id)
+        } else {
+            self.provider()?.transaction_sender(id)
+        }
     }
 }
 
 impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
-    fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Receipt>> {
+    type Receipt = ReceiptTy<N>;
+
+    fn receipt(&self, id: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
         self.static_file_provider.get_with_static_file_or_database(
             StaticFileSegment::Receipts,
             id,
@@ -483,18 +639,21 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
         )
     }
 
-    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Receipt>> {
+    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
         self.provider()?.receipt_by_hash(hash)
     }
 
-    fn receipts_by_block(&self, block: BlockHashOrNumber) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block(
+        &self,
+        block: BlockHashOrNumber,
+    ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
         self.provider()?.receipts_by_block(block)
     }
 
     fn receipts_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
-    ) -> ProviderResult<Vec<Receipt>> {
+    ) -> ProviderResult<Vec<Self::Receipt>> {
         self.static_file_provider.get_range_with_static_file_or_database(
             StaticFileSegment::Receipts,
             to_range(range),
@@ -503,19 +662,28 @@ impl<N: ProviderNodeTypes> ReceiptProvider for ProviderFactory<N> {
             |_| true,
         )
     }
+
+    fn receipts_by_block_range(
+        &self,
+        block_range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<Vec<Self::Receipt>>> {
+        self.provider()?.receipts_by_block_range(block_range)
+    }
 }
 
-impl<N: ProviderNodeTypes> WithdrawalsProvider for ProviderFactory<N> {
-    fn withdrawals_by_block(
+impl<N: ProviderNodeTypes> BlockBodyIndicesProvider for ProviderFactory<N> {
+    fn block_body_indices(
         &self,
-        id: BlockHashOrNumber,
-        timestamp: u64,
-    ) -> ProviderResult<Option<Withdrawals>> {
-        self.provider()?.withdrawals_by_block(id, timestamp)
+        number: BlockNumber,
+    ) -> ProviderResult<Option<StoredBlockBodyIndices>> {
+        self.provider()?.block_body_indices(number)
     }
 
-    fn latest_withdrawal(&self) -> ProviderResult<Option<Withdrawal>> {
-        self.provider()?.latest_withdrawal()
+    fn block_body_indices_range(
+        &self,
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<StoredBlockBodyIndices>> {
+        self.provider()?.block_body_indices_range(range)
     }
 }
 
@@ -529,58 +697,6 @@ impl<N: ProviderNodeTypes> StageCheckpointReader for ProviderFactory<N> {
     }
     fn get_all_checkpoints(&self) -> ProviderResult<Vec<(String, StageCheckpoint)>> {
         self.provider()?.get_all_checkpoints()
-    }
-}
-
-impl<N: ProviderNodeTypes> EvmEnvProvider for ProviderFactory<N> {
-    fn fill_env_at<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        block_env: &mut BlockEnv,
-        at: BlockHashOrNumber,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.provider()?.fill_env_at(cfg, block_env, at, evm_config)
-    }
-
-    fn fill_env_with_header<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        block_env: &mut BlockEnv,
-        header: &Header,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.provider()?.fill_env_with_header(cfg, block_env, header, evm_config)
-    }
-
-    fn fill_cfg_env_at<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        at: BlockHashOrNumber,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.provider()?.fill_cfg_env_at(cfg, at, evm_config)
-    }
-
-    fn fill_cfg_env_with_header<EvmConfig>(
-        &self,
-        cfg: &mut CfgEnvWithHandlerCfg,
-        header: &Header,
-        evm_config: EvmConfig,
-    ) -> ProviderResult<()>
-    where
-        EvmConfig: ConfigureEvmEnv<Header = Header>,
-    {
-        self.provider()?.fill_cfg_env_with_header(cfg, header, evm_config)
     }
 }
 
@@ -605,6 +721,48 @@ impl<N: ProviderNodeTypes> PruneCheckpointReader for ProviderFactory<N> {
     }
 }
 
+impl<N: ProviderNodeTypes> HashedPostStateProvider for ProviderFactory<N> {
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState {
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
+    }
+}
+
+impl<N: ProviderNodeTypes> MetadataProvider for ProviderFactory<N> {
+    fn get_metadata(&self, key: &str) -> ProviderResult<Option<Vec<u8>>> {
+        self.provider()?.get_metadata(key)
+    }
+}
+
+impl<N> fmt::Debug for ProviderFactory<N>
+where
+    N: NodeTypesWithDB<DB: fmt::Debug, ChainSpec: fmt::Debug, Storage: fmt::Debug>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            db,
+            chain_spec,
+            static_file_provider,
+            prune_modes,
+            storage,
+            storage_settings,
+            rocksdb_provider,
+            changeset_cache,
+            runtime,
+        } = self;
+        f.debug_struct("ProviderFactory")
+            .field("db", &db)
+            .field("chain_spec", &chain_spec)
+            .field("static_file_provider", &static_file_provider)
+            .field("prune_modes", &prune_modes)
+            .field("storage", &storage)
+            .field("storage_settings", &*storage_settings.read())
+            .field("rocksdb_provider", &rocksdb_provider)
+            .field("changeset_cache", &changeset_cache)
+            .field("runtime", &runtime)
+            .finish()
+    }
+}
+
 impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
     fn clone(&self) -> Self {
         Self {
@@ -612,6 +770,11 @@ impl<N: NodeTypesWithDB> Clone for ProviderFactory<N> {
             chain_spec: self.chain_spec.clone(),
             static_file_provider: self.static_file_provider.clone(),
             prune_modes: self.prune_modes.clone(),
+            storage: self.storage.clone(),
+            storage_settings: self.storage_settings.clone(),
+            rocksdb_provider: self.rocksdb_provider.clone(),
+            changeset_cache: self.changeset_cache.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
@@ -622,23 +785,22 @@ mod tests {
     use crate::{
         providers::{StaticFileProvider, StaticFileWriter},
         test_utils::{blocks::TEST_BLOCK, create_test_provider_factory, MockNodeTypesWithDB},
-        BlockHashReader, BlockNumReader, BlockWriter, HeaderSyncGapProvider, TransactionsProvider,
+        BlockHashReader, BlockNumReader, BlockWriter, DBProvider, HeaderSyncGapProvider,
+        TransactionsProvider,
     };
-    use alloy_primitives::{TxNumber, B256, U256};
+    use alloy_primitives::{TxNumber, B256};
     use assert_matches::assert_matches;
-    use rand::Rng;
     use reth_chainspec::ChainSpecBuilder;
     use reth_db::{
         mdbx::DatabaseArguments,
-        tables,
-        test_utils::{create_test_static_files_dir, ERROR_TEMPDIR},
+        test_utils::{create_test_rocksdb_dir, create_test_static_files_dir, ERROR_TEMPDIR},
     };
-    use reth_primitives::StaticFileSegment;
+    use reth_db_api::tables;
+    use reth_primitives_traits::SignerRecoverable;
     use reth_prune_types::{PruneMode, PruneModes};
     use reth_storage_errors::provider::ProviderError;
     use reth_testing_utils::generators::{self, random_block, random_header, BlockParams};
     use std::{ops::RangeInclusive, sync::Arc};
-    use tokio::sync::watch;
 
     #[test]
     fn common_history_provider() {
@@ -670,14 +832,17 @@ mod tests {
     fn provider_factory_with_database_path() {
         let chain_spec = ChainSpecBuilder::mainnet().build();
         let (_static_dir, static_dir_path) = create_test_static_files_dir();
+        let (_rocksdb_dir, rocksdb_path) = create_test_rocksdb_dir();
+        let _db_tempdir = tempfile::TempDir::new().expect(ERROR_TEMPDIR);
         let factory = ProviderFactory::<MockNodeTypesWithDB<DatabaseEnv>>::new_with_database_path(
-            tempfile::TempDir::new().expect(ERROR_TEMPDIR).into_path(),
+            _db_tempdir.path(),
             Arc::new(chain_spec),
             DatabaseArguments::new(Default::default()),
             StaticFileProvider::read_write(static_dir_path).unwrap(),
+            RocksDBProvider::builder(&rocksdb_path).build().unwrap(),
+            reth_tasks::Runtime::test(),
         )
         .unwrap();
-
         let provider = factory.provider().unwrap();
         provider.block_hash(0).unwrap();
         let provider_rw = factory.provider_rw().unwrap();
@@ -687,84 +852,67 @@ mod tests {
 
     #[test]
     fn insert_block_with_prune_modes() {
-        let factory = create_test_provider_factory();
-
         let block = TEST_BLOCK.clone();
+
         {
+            let factory = create_test_provider_factory();
             let provider = factory.provider_rw().unwrap();
-            assert_matches!(
-                provider.insert_block(block.clone().try_seal_with_senders().unwrap()),
-                Ok(_)
-            );
+            assert_matches!(provider.insert_block(&block.clone().try_recover().unwrap()), Ok(_));
             assert_matches!(
                 provider.transaction_sender(0), Ok(Some(sender))
-                if sender == block.body.transactions[0].recover_signer().unwrap()
+                if sender == block.body().transactions[0].recover_signer().unwrap()
             );
-            assert_matches!(provider.transaction_id(block.body.transactions[0].hash), Ok(Some(0)));
+            assert_matches!(
+                provider.transaction_id(*block.body().transactions[0].tx_hash()),
+                Ok(Some(0))
+            );
         }
 
         {
             let prune_modes = PruneModes {
                 sender_recovery: Some(PruneMode::Full),
                 transaction_lookup: Some(PruneMode::Full),
-                ..PruneModes::none()
+                ..PruneModes::default()
             };
-            let provider = factory.with_prune_modes(prune_modes).provider_rw().unwrap();
-            assert_matches!(
-                provider.insert_block(block.clone().try_seal_with_senders().unwrap(),),
-                Ok(_)
-            );
+            // Keep factory alive until provider is dropped to prevent TempDatabase cleanup
+            let factory = create_test_provider_factory().with_prune_modes(prune_modes);
+            let provider = factory.provider_rw().unwrap();
+            assert_matches!(provider.insert_block(&block.clone().try_recover().unwrap()), Ok(_));
             assert_matches!(provider.transaction_sender(0), Ok(None));
-            assert_matches!(provider.transaction_id(block.body.transactions[0].hash), Ok(None));
+            assert_matches!(
+                provider.transaction_id(*block.body().transactions[0].tx_hash()),
+                Ok(None)
+            );
         }
     }
 
     #[test]
     fn take_block_transaction_range_recover_senders() {
-        let factory = create_test_provider_factory();
-
         let mut rng = generators::rng();
         let block =
             random_block(&mut rng, 0, BlockParams { tx_count: Some(3), ..Default::default() });
 
         let tx_ranges: Vec<RangeInclusive<TxNumber>> = vec![0..=0, 1..=1, 2..=2, 0..=1, 1..=2];
         for range in tx_ranges {
+            let factory = create_test_provider_factory();
             let provider = factory.provider_rw().unwrap();
 
-            assert_matches!(
-                provider.insert_block(block.clone().try_seal_with_senders().unwrap()),
-                Ok(_)
-            );
+            assert_matches!(provider.insert_block(&block.clone().try_recover().unwrap()), Ok(_));
 
-            let senders = provider.take::<tables::TransactionSenders>(range.clone());
+            let senders = provider.take::<tables::TransactionSenders>(range.clone()).unwrap();
             assert_eq!(
                 senders,
-                Ok(range
+                range
                     .clone()
                     .map(|tx_number| (
                         tx_number,
-                        block.body.transactions[tx_number as usize].recover_signer().unwrap()
+                        block.body().transactions[tx_number as usize].recover_signer().unwrap()
                     ))
-                    .collect())
+                    .collect::<Vec<_>>()
             );
 
             let db_senders = provider.senders_by_tx_range(range);
-            assert_eq!(db_senders, Ok(vec![]));
-
-            let result = provider.take_block_transaction_range(0..=0);
-            assert_eq!(
-                result,
-                Ok(vec![(
-                    0,
-                    block
-                        .body
-                        .transactions
-                        .iter()
-                        .cloned()
-                        .map(|tx| tx.into_ecrecovered().unwrap())
-                        .collect()
-                )])
-            )
+            assert!(matches!(db_senders, Ok(ref v) if v.is_empty()));
         }
     }
 
@@ -774,8 +922,6 @@ mod tests {
         let provider = factory.provider_rw().unwrap();
 
         let mut rng = generators::rng();
-        let consensus_tip = rng.gen();
-        let (_tip_tx, tip_rx) = watch::channel(consensus_tip);
 
         // Genesis
         let checkpoint = 0;
@@ -783,7 +929,7 @@ mod tests {
 
         // Empty database
         assert_matches!(
-            provider.sync_gap(tip_rx.clone(), checkpoint),
+            provider.local_tip_header(checkpoint),
             Err(ProviderError::HeaderNotFound(block_number))
                 if block_number.as_number().unwrap() == checkpoint
         );
@@ -792,12 +938,12 @@ mod tests {
         let static_file_provider = provider.static_file_provider();
         let mut static_file_writer =
             static_file_provider.latest_writer(StaticFileSegment::Headers).unwrap();
-        static_file_writer.append_header(head.header(), U256::ZERO, &head.hash()).unwrap();
+        static_file_writer.append_header(head.header(), &head.hash()).unwrap();
         static_file_writer.commit().unwrap();
         drop(static_file_writer);
 
-        let gap = provider.sync_gap(tip_rx, checkpoint).unwrap();
-        assert_eq!(gap.local_head, head);
-        assert_eq!(gap.target.tip(), consensus_tip.into());
+        let local_head = provider.local_tip_header(checkpoint).unwrap();
+
+        assert_eq!(local_head, head);
     }
 }

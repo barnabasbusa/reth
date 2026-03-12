@@ -10,29 +10,36 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bundle;
 pub mod core;
+pub mod ext;
 pub mod filter;
 pub mod helpers;
 pub mod node;
 pub mod pubsub;
 pub mod types;
 
-pub use reth_rpc_types_compat::TransactionCompat;
-
 pub use bundle::{EthBundleApiServer, EthCallBundleApiServer};
 pub use core::{EthApiServer, FullEthApiServer};
-pub use filter::EthFilterApiServer;
-pub use helpers::error::{AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError};
+pub use ext::L2EthApiExtServer;
+pub use filter::{EngineEthFilter, EthFilterApiServer, QueryLimits};
 pub use node::{RpcNodeCore, RpcNodeCoreExt};
 pub use pubsub::EthPubSubApiServer;
-pub use types::{EthApiTypes, FullEthApiTypes, RpcBlock, RpcReceipt, RpcTransaction};
+pub use reth_rpc_convert::*;
+pub use reth_rpc_eth_types::error::{
+    AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError,
+};
+pub use types::{EthApiTypes, FullEthApiTypes, RpcBlock, RpcHeader, RpcReceipt, RpcTransaction};
 
 #[cfg(feature = "client")]
 pub use bundle::{EthBundleApiClient, EthCallBundleApiClient};
 #[cfg(feature = "client")]
 pub use core::EthApiClient;
 #[cfg(feature = "client")]
+pub use ext::L2EthApiExtClient;
+#[cfg(feature = "client")]
 pub use filter::EthFilterApiClient;
+
+use reth_trie_common as _;

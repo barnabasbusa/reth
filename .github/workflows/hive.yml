@@ -5,7 +5,6 @@ name: hive
 on:
   workflow_dispatch:
   schedule:
-    # every day
     - cron: "0 0 * * *"
 
 env:
@@ -16,72 +15,76 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  prepare-reth:
-    if: github.repository == 'paradigmxyz/reth'
-    timeout-minutes: 45
-    runs-on:
-      group: Reth
-    steps:
-      - uses: actions/checkout@v4
-      - run: mkdir artifacts
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-      - name: Build reth
-        run: |
-          cargo build --features asm-keccak --profile hivetests --bin reth --locked
-          mkdir dist && cp ./target/hivetests/reth ./dist/reth
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build and export reth image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: .github/assets/hive/Dockerfile
-          tags: ghcr.io/paradigmxyz/reth:latest
-          outputs: type=docker,dest=./artifacts/reth_image.tar
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+  build-reth-stable:
+    uses: ./.github/workflows/docker-test.yml
+    with:
+      hive_target: hive-stable
+      artifact_name: "reth-stable"
+    secrets: inherit
 
-      - name: Upload reth image
-        uses: actions/upload-artifact@v4
-        with:
-          name: artifacts
-          path: ./artifacts
+  build-reth-edge:
+    uses: ./.github/workflows/docker-test.yml
+    with:
+      hive_target: hive-edge
+      artifact_name: "reth-edge"
+    secrets: inherit
 
   prepare-hive:
     if: github.repository == 'paradigmxyz/reth'
     timeout-minutes: 45
-    runs-on:
-      group: Reth
+    runs-on: ${{ github.repository == 'paradigmxyz/reth' && 'depot-ubuntu-latest-4' || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Checkout hive tests
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ethereum/hive
-          ref: master
           path: hivetests
 
-      - uses: actions/setup-go@v5
+      - name: Get hive commit hash
+        id: hive-commit
+        run: echo "hash=$(cd hivetests && git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-go@v6
         with:
           go-version: "^1.13.1"
       - run: go version
 
+      - name: Restore hive assets cache
+        id: cache-hive
+        uses: actions/cache@v5
+        with:
+          path: ./hive_assets
+          key: hive-assets-${{ steps.hive-commit.outputs.hash }}-${{ hashFiles('.github/scripts/hive/build_simulators.sh') }}
+
       - name: Build hive assets
-        run: .github/assets/hive/build_simulators.sh
+        if: steps.cache-hive.outputs.cache-hit != 'true'
+        run: .github/scripts/hive/build_simulators.sh
+
+      - name: Load cached Docker images
+        if: steps.cache-hive.outputs.cache-hit == 'true'
+        run: |
+          cd hive_assets
+          for tar_file in *.tar; do
+            if [ -f "$tar_file" ]; then
+              echo "Loading $tar_file..."
+              docker load -i "$tar_file"
+            fi
+          done
+          # Make hive binary executable
+          chmod +x hive
 
       - name: Upload hive assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hive_assets
           path: ./hive_assets
   test:
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
+        storage: [stable, edge]
         # ethereum/rpc to be deprecated:
         # https://github.com/ethereum/hive/pull/1117
         scenario:
@@ -90,27 +93,24 @@ jobs:
           - sim: ethereum/sync
           - sim: devp2p
             limit: discv4
+          # started failing after https://github.com/ethereum/go-ethereum/pull/31843, no
+          # action on our side, remove from here when we get unexpected passes on these tests
+          # - sim: devp2p
+          #  limit: eth
+          #  include:
+          #    - MaliciousHandshake
+          #    # failures tracked in https://github.com/paradigmxyz/reth/issues/14825
+          #    - Status
+          #    - GetBlockHeaders
+          #    - ZeroRequestID
+          #    - GetBlockBodies
+          #    - Transaction
+          #    - NewPooledTxs
           - sim: devp2p
-            limit: eth
+            limit: discv5
             include:
-              # status
-              - TestStatus
-              # get block headers
-              - TestGetBlockHeaders
-              - TestSimultaneousRequests
-              - TestSameRequestID
-              - TestZeroRequestID
-              # get block bodies
-              - TestGetBlockBodies
-              # malicious handshakes + status
-              - TestMaliciousHandshake
-              - TestMaliciousStatus
-              # test transactions
-              - TestLargeTxRequest
-              - TestTransaction
-              - TestInvalidTxs
-              - TestNewPooledTxs
-              - TestBlobViolations
+              # failures tracked at https://github.com/paradigmxyz/reth/issues/14825
+              - PingLargeRequestID
           - sim: ethereum/engine
             limit: engine-exchange-capabilities
           - sim: ethereum/engine
@@ -143,67 +143,74 @@ jobs:
               - eth_syncing
               # debug_ rpc methods
               - debug_
-          # Pyspec cancun jobs
-          # TODO: uncomment when https://github.com/ethereum/hive/issues/1147 is fixed
-          #- sim: pyspec
-          #  include: [cancun/eip4844]
-          #- sim: pyspec
-          #  include: [cancun/eip4788]
-          #- sim: pyspec
-          #  include: [cancun/eip6780]
-          #- sim: pyspec
-          #  include: [cancun/eip5656]
-          #- sim: pyspec
-          #  include: [cancun/eip1153]
-          #- sim: pyspec
-          #  include: [cancun/eip7516]
-          # Pyspec shanghai jobs
-          #- sim: pyspec
-          #  include: [shanghai/eip3651]
-          #- sim: pyspec
-          #  include: [shanghai/eip3855]
-          #- sim: pyspec
-          #  include: [shanghai/eip3860]
-          #- sim: pyspec
-          #  include: [shanghai/eip4895]
-          # Pyspec merge and earlier jobs
-          #- sim: pyspec
-          #  include: [merge/]
-          #- sim: pyspec
-          #  include: [berlin/]
-          #- sim: pyspec
-          #  include: [istanbul/]
-          #- sim: pyspec
-          #  include: [homestead/]
-          #- sim: pyspec
-          #  include: [frontier/]
+
+          # consume-engine
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/osaka.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/prague.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/cancun.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/shanghai.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/berlin.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/istanbul.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/homestead.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/frontier.*
+          - sim: ethereum/eels/consume-engine
+            limit: .*tests/paris.*
+
+          # consume-rlp
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/osaka.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/prague.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/cancun.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/shanghai.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/berlin.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/istanbul.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/homestead.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/frontier.*
+          - sim: ethereum/eels/consume-rlp
+            limit: .*tests/paris.*
     needs:
-      - prepare-reth
+      - build-reth-stable
+      - build-reth-edge
       - prepare-hive
-    name: run ${{ matrix.scenario.sim }}${{ matrix.scenario.limit && format(' - {0}', matrix.scenario.limit) }}
-    runs-on:
-      group: Reth
+    name: ${{ matrix.storage }} / ${{ matrix.scenario.sim }}${{ matrix.scenario.limit && format(' - {0}', matrix.scenario.limit) }}
+    # Use larger runners for eels tests to avoid OOM runner crashes
+    runs-on: ${{ github.repository == 'paradigmxyz/reth' && (contains(matrix.scenario.sim, 'eels') && 'depot-ubuntu-latest-8' || 'depot-ubuntu-latest-4') || 'ubuntu-latest' }}
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Download hive assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: hive_assets
           path: /tmp
 
       - name: Download reth image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          name: artifacts
+          name: reth-${{ matrix.storage }}
           path: /tmp
 
       - name: Load Docker images
-        run: .github/assets/hive/load_images.sh
+        run: .github/scripts/hive/load_images.sh
 
       - name: Move hive binary
         run: |
@@ -211,7 +218,7 @@ jobs:
           chmod +x /usr/local/bin/hive
 
       - name: Checkout hive tests
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ethereum/hive
           ref: master
@@ -231,11 +238,11 @@ jobs:
             FILTER="/"
           fi
           echo "filter: $FILTER"
-          .github/assets/hive/run_simulator.sh "${{ matrix.scenario.sim }}" "$FILTER"
+          .github/scripts/hive/run_simulator.sh "${{ matrix.scenario.sim }}" "$FILTER"
 
       - name: Parse hive output
         run: |
-          find hivetests/workspace/logs -type f -name "*.json" ! -name "hive.json" | xargs -I {} python .github/assets/hive/parse.py {} --exclusion .github/assets/hive/expected_failures.yaml
+          find hivetests/workspace/logs -type f -name "*.json" ! -name "hive.json" | xargs -I {} python .github/scripts/hive/parse.py {} --exclusion .github/scripts/hive/expected_failures.yaml --ignored .github/scripts/hive/ignored_tests.yaml
 
       - name: Print simulator output
         if: ${{ failure() }}
@@ -249,12 +256,11 @@ jobs:
   notify-on-error:
     needs: test
     if: failure()
-    runs-on:
-      group: Reth
+    runs-on: ubuntu-latest
     steps:
       - name: Slack Webhook Action
         uses: rtCamp/action-slack-notify@v2
         env:
           SLACK_COLOR: ${{ job.status }}
           SLACK_MESSAGE: "Failed run: https://github.com/paradigmxyz/reth/actions/runs/${{ github.run_id }}"
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_HIVE_WEBHOOK_URL }}

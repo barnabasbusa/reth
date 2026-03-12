@@ -1,4 +1,9 @@
-use jsonrpsee::{server::middleware::rpc::RpcServiceT, types::Request, MethodResponse, RpcModule};
+use jsonrpsee::{
+    core::middleware::{Batch, Notification},
+    server::middleware::rpc::RpcServiceT,
+    types::Request,
+    MethodResponse, RpcModule,
+};
 use reth_metrics::{
     metrics::{Counter, Histogram},
     Metrics,
@@ -57,8 +62,7 @@ impl RpcRequestMetrics {
         Self::new(module, RpcTransport::WebSocket)
     }
 
-    /// Creates a new instance of the metrics layer for Ws.
-    #[allow(unused)]
+    /// Creates a new instance of the metrics layer for Ipc.
     pub(crate) fn ipc(module: &RpcModule<()>) -> Self {
         Self::new(module, RpcTransport::Ipc)
     }
@@ -100,13 +104,15 @@ impl<S> RpcRequestMetricsService<S> {
     }
 }
 
-impl<'a, S> RpcServiceT<'a> for RpcRequestMetricsService<S>
+impl<S> RpcServiceT for RpcRequestMetricsService<S>
 where
-    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S: RpcServiceT<MethodResponse = MethodResponse> + Send + Sync + Clone + 'static,
 {
-    type Future = MeteredRequestFuture<S::Future>;
+    type MethodResponse = S::MethodResponse;
+    type NotificationResponse = S::NotificationResponse;
+    type BatchResponse = S::BatchResponse;
 
-    fn call(&self, req: Request<'a>) -> Self::Future {
+    fn call<'a>(&self, req: Request<'a>) -> impl Future<Output = S::MethodResponse> + Send + 'a {
         self.metrics.inner.connection_metrics.requests_started_total.increment(1);
         let call_metrics = self.metrics.inner.call_metrics.get_key_value(req.method.as_ref());
         if let Some((_, call_metrics)) = &call_metrics {
@@ -118,6 +124,30 @@ where
             metrics: self.metrics.clone(),
             method: call_metrics.map(|(method, _)| *method),
         }
+    }
+
+    fn batch<'a>(&self, req: Batch<'a>) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        self.metrics.inner.connection_metrics.batches_started_total.increment(1);
+
+        for batch_entry in req.iter().flatten() {
+            let method_name = batch_entry.method_name();
+            if let Some(call_metrics) = self.metrics.inner.call_metrics.get(method_name) {
+                call_metrics.started_total.increment(1);
+            }
+        }
+
+        MeteredBatchRequestsFuture {
+            fut: self.inner.batch(req),
+            started_at: Instant::now(),
+            metrics: self.metrics.clone(),
+        }
+    }
+
+    fn notification<'a>(
+        &self,
+        n: Notification<'a>,
+    ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.inner.notification(n)
     }
 }
 
@@ -177,12 +207,47 @@ impl<F: Future<Output = MethodResponse>> Future for MeteredRequestFuture<F> {
     }
 }
 
+/// Response future to update the metrics for a batch of request/response pairs.
+#[pin_project::pin_project]
+pub struct MeteredBatchRequestsFuture<F> {
+    #[pin]
+    fut: F,
+    /// time when the batch request started
+    started_at: Instant,
+    /// metrics for the batch
+    metrics: RpcRequestMetrics,
+}
+
+impl<F> std::fmt::Debug for MeteredBatchRequestsFuture<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MeteredBatchRequestsFuture")
+    }
+}
+
+impl<F> Future for MeteredBatchRequestsFuture<F>
+where
+    F: Future,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let res = this.fut.poll(cx);
+
+        if res.is_ready() {
+            let elapsed = this.started_at.elapsed().as_secs_f64();
+            this.metrics.inner.connection_metrics.batches_finished_total.increment(1);
+            this.metrics.inner.connection_metrics.batch_response_time_seconds.record(elapsed);
+        }
+        res
+    }
+}
+
 /// The transport protocol used for the RPC connection.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum RpcTransport {
     Http,
     WebSocket,
-    #[allow(unused)]
     Ipc,
 }
 
@@ -216,6 +281,12 @@ struct RpcServerConnectionMetrics {
     requests_finished_total: Counter,
     /// Response for a single request/response pair
     request_time_seconds: Histogram,
+    /// The number of batch requests started
+    batches_started_total: Counter,
+    /// The number of batch requests finished
+    batches_finished_total: Counter,
+    /// Response time for a batch request
+    batch_response_time_seconds: Histogram,
 }
 
 /// Metrics for the RPC calls

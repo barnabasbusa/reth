@@ -1,40 +1,65 @@
-use alloy_eips::eip7685::Requests;
-use alloy_primitives::U256;
-use revm::db::BundleState;
+use alloy_primitives::{Address, B256, U256};
+use reth_primitives_traits::{Account, Bytecode};
+use revm::database::{states::BundleState, BundleAccount};
 
-/// A helper type for ethereum block inputs that consists of a block and the total difficulty.
-#[derive(Debug)]
-pub struct BlockExecutionInput<'a, Block> {
-    /// The block to execute.
-    pub block: &'a Block,
-    /// The total difficulty of the block.
-    pub total_difficulty: U256,
-}
+pub use alloy_evm::block::BlockExecutionResult;
 
-impl<'a, Block> BlockExecutionInput<'a, Block> {
-    /// Creates a new input.
-    pub const fn new(block: &'a Block, total_difficulty: U256) -> Self {
-        Self { block, total_difficulty }
-    }
-}
-
-impl<'a, Block> From<(&'a Block, U256)> for BlockExecutionInput<'a, Block> {
-    fn from((block, total_difficulty): (&'a Block, U256)) -> Self {
-        Self::new(block, total_difficulty)
-    }
-}
-
-/// The output of an ethereum block.
-///
-/// Contains the state changes, transaction receipts, and total gas used in the block.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`BlockExecutionResult`] combined with state.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    derive_more::AsRef,
+    derive_more::AsMut,
+    derive_more::Deref,
+    derive_more::DerefMut,
+)]
 pub struct BlockExecutionOutput<T> {
+    /// All the receipts of the transactions in the block.
+    #[as_ref]
+    #[as_mut]
+    #[deref]
+    #[deref_mut]
+    pub result: BlockExecutionResult<T>,
     /// The changed state of the block after execution.
     pub state: BundleState,
-    /// All the receipts of the transactions in the block.
-    pub receipts: Vec<T>,
-    /// All the EIP-7685 requests in the block.
-    pub requests: Requests,
-    /// The total gas used by the block.
-    pub gas_used: u64,
+}
+
+impl<T> BlockExecutionOutput<T> {
+    /// Return bytecode if known.
+    pub fn bytecode(&self, code_hash: &B256) -> Option<Bytecode> {
+        self.state.bytecode(code_hash).map(Bytecode)
+    }
+
+    /// Get account if account is known.
+    pub fn account(&self, address: &Address) -> Option<Option<Account>> {
+        self.state.account(address).map(|a| a.info.as_ref().map(Into::into))
+    }
+
+    /// Returns the state [`BundleAccount`] for the given address.
+    pub fn account_state(&self, address: &Address) -> Option<&BundleAccount> {
+        self.state.account(address)
+    }
+
+    /// Get storage if value is known.
+    ///
+    /// This means that depending on status we can potentially return `U256::ZERO`.
+    pub fn storage(&self, address: &Address, storage_key: U256) -> Option<U256> {
+        self.state.account(address).and_then(|a| a.storage_slot(storage_key))
+    }
+}
+
+impl<T> Default for BlockExecutionOutput<T> {
+    fn default() -> Self {
+        Self {
+            result: BlockExecutionResult {
+                receipts: Default::default(),
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+            },
+            state: Default::default(),
+        }
+    }
 }

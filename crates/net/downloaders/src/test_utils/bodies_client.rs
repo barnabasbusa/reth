@@ -1,14 +1,14 @@
-use alloy_primitives::B256;
+use alloy_primitives::{map::B256Map, B256};
+use reth_ethereum_primitives::BlockBody;
 use reth_network_p2p::{
     bodies::client::{BodiesClient, BodiesFut},
     download::DownloadClient,
     priority::Priority,
 };
 use reth_network_peers::PeerId;
-use reth_primitives::BlockBody;
 use std::{
-    collections::HashMap,
     fmt::Debug,
+    ops::RangeInclusive,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 /// A [`BodiesClient`] for testing.
 #[derive(Debug, Default)]
 pub struct TestBodiesClient {
-    bodies: Arc<Mutex<HashMap<B256, BlockBody>>>,
+    bodies: Arc<Mutex<B256Map<BlockBody>>>,
     should_delay: bool,
     max_batch_size: Option<usize>,
     times_requested: AtomicU64,
@@ -28,7 +28,7 @@ pub struct TestBodiesClient {
 }
 
 impl TestBodiesClient {
-    pub(crate) fn with_bodies(mut self, bodies: HashMap<B256, BlockBody>) -> Self {
+    pub(crate) fn with_bodies(mut self, bodies: B256Map<BlockBody>) -> Self {
         self.bodies = Arc::new(Mutex::new(bodies));
         self
     }
@@ -60,7 +60,7 @@ impl TestBodiesClient {
     /// empty_response_mod == 0`.
     pub(crate) fn should_respond_empty(&self) -> bool {
         if let Some(empty_response_mod) = self.empty_response_mod {
-            self.times_requested.load(Ordering::Relaxed) % empty_response_mod == 0
+            self.times_requested.load(Ordering::Relaxed).is_multiple_of(empty_response_mod)
         } else {
             false
         }
@@ -78,12 +78,14 @@ impl DownloadClient for TestBodiesClient {
 }
 
 impl BodiesClient for TestBodiesClient {
+    type Body = BlockBody;
     type Output = BodiesFut;
 
-    fn get_block_bodies_with_priority(
+    fn get_block_bodies_with_priority_and_range_hint(
         &self,
         hashes: Vec<B256>,
         _priority: Priority,
+        _range_hint: Option<RangeInclusive<u64>>,
     ) -> Self::Output {
         let should_delay = self.should_delay;
         let bodies = self.bodies.clone();

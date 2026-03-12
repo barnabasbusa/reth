@@ -32,7 +32,7 @@ pub trait Compress: Send + Sync + Sized + Debug {
     }
 
     /// Compresses data to a given buffer.
-    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B);
+    fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B);
 }
 
 /// Trait that will transform the data to be read from the DB.
@@ -46,10 +46,40 @@ pub trait Decompress: Send + Sync + Sized + Debug {
     }
 }
 
+/// Trait for converting encoded types to `Vec<u8>`.
+///
+/// This is implemented for all `AsRef<[u8]>` types. For `Vec<u8>` this is a no-op,
+/// for other types like `ArrayVec` or fixed arrays it performs a copy.
+pub trait IntoVec: AsRef<[u8]> {
+    /// Convert to a `Vec<u8>`.
+    fn into_vec(self) -> Vec<u8>;
+}
+
+impl IntoVec for Vec<u8> {
+    #[inline]
+    fn into_vec(self) -> Vec<u8> {
+        self
+    }
+}
+
+impl<const N: usize> IntoVec for [u8; N] {
+    #[inline]
+    fn into_vec(self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+
+impl<const N: usize> IntoVec for arrayvec::ArrayVec<u8, N> {
+    #[inline]
+    fn into_vec(self) -> Vec<u8> {
+        self.to_vec()
+    }
+}
+
 /// Trait that will transform the data to be saved in the DB.
 pub trait Encode: Send + Sync + Sized + Debug {
     /// Encoded type.
-    type Encoded: AsRef<[u8]> + Into<Vec<u8>> + Send + Sync + Ord + Debug;
+    type Encoded: AsRef<[u8]> + IntoVec + Send + Sync + Ord + Debug;
 
     /// Encodes data going into the database.
     fn encode(self) -> Self::Encoded;
@@ -88,6 +118,9 @@ pub trait Table: Send + Sync + Debug + 'static {
     /// The table's name.
     const NAME: &'static str;
 
+    /// Whether the table is also a `DUPSORT` table.
+    const DUPSORT: bool;
+
     /// Key element of `Table`.
     ///
     /// Sorting should be taken into account when encoding this.
@@ -95,6 +128,15 @@ pub trait Table: Send + Sync + Debug + 'static {
 
     /// Value element of `Table`.
     type Value: Value;
+}
+
+/// Trait that provides object-safe access to the table's metadata.
+pub trait TableInfo: Send + Sync + Debug + 'static {
+    /// The table's name.
+    fn name(&self) -> &'static str;
+
+    /// Whether the table is a `DUPSORT` table.
+    fn is_dupsort(&self) -> bool;
 }
 
 /// Tuple with `T::Key` and `T::Value`.
@@ -120,13 +162,16 @@ pub trait TableImporter: DbTxMut {
 
         for kv in source_tx.cursor_read::<T>()?.walk(None)? {
             let (k, v) = kv?;
-            destination_cursor.append(k, v)?;
+            destination_cursor.append(k, &v)?;
         }
 
         Ok(())
     }
 
     /// Imports table data from another transaction within a range.
+    ///
+    /// This method works correctly with both regular and `DupSort` tables. For `DupSort` tables,
+    /// all duplicate entries within the range are preserved during import.
     fn import_table_with_range<T: Table, R: DbTx>(
         &self,
         source_tx: &R,
@@ -145,7 +190,7 @@ pub trait TableImporter: DbTxMut {
         };
         for row in source_range? {
             let (key, value) = row?;
-            destination_cursor.append(key, value)?;
+            destination_cursor.append(key, &value)?;
         }
 
         Ok(())

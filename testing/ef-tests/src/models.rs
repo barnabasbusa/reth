@@ -1,18 +1,20 @@
 //! Shared models for <https://github.com/ethereum/tests>
 
 use crate::{assert::assert_equal, Error};
+use alloy_consensus::Header as RethHeader;
+use alloy_eips::eip4895::Withdrawals;
+use alloy_genesis::GenesisAccount;
 use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, B64, U256};
-use reth_chainspec::{ChainSpec, ChainSpecBuilder};
-use reth_db::tables;
-use reth_db_api::{
-    cursor::DbDupCursorRO,
-    transaction::{DbTx, DbTxMut},
-};
-use reth_primitives::{
-    Account as RethAccount, Bytecode, Header as RethHeader, SealedHeader, StorageEntry, Withdrawals,
-};
+use reth_chainspec::{ChainSpec, ChainSpecBuilder, EthereumHardfork, ForkCondition};
+use reth_db_api::{cursor::DbDupCursorRO, tables, transaction::DbTx};
+use reth_primitives_traits::SealedHeader;
+use revm::primitives::HashMap;
 use serde::Deserialize;
-use std::{collections::BTreeMap, ops::Deref};
+use std::{
+    collections::BTreeMap,
+    ops::Deref,
+    sync::{Arc, OnceLock, RwLock},
+};
 
 /// The definition of a blockchain test.
 #[derive(Debug, PartialEq, Eq, Deserialize)]
@@ -27,8 +29,6 @@ pub struct BlockchainTest {
     pub blocks: Vec<Block>,
     /// The expected post state.
     pub post_state: Option<BTreeMap<Address, Account>>,
-    /// The expected post state merkle root.
-    pub post_state_hash: Option<B256>,
     /// The test pre-state.
     pub pre: State,
     /// Hash of the best block.
@@ -88,6 +88,8 @@ pub struct Header {
     pub parent_beacon_block_root: Option<B256>,
     /// Requests root.
     pub requests_hash: Option<B256>,
+    /// Target blobs per block.
+    pub target_blobs_per_block: Option<U256>,
 }
 
 impl From<Header> for SealedHeader {
@@ -127,6 +129,10 @@ pub struct Block {
     pub block_header: Option<Header>,
     /// RLP encoded block bytes
     pub rlp: Bytes,
+    /// If the execution of the block should fail,
+    /// `expect_exception` is `Some`.
+    /// Its contents detail the reason for the failure.
+    pub expect_exception: Option<String>,
     /// Transactions
     pub transactions: Option<Vec<Transaction>>,
     /// Uncle/ommer headers
@@ -152,36 +158,32 @@ pub struct TransactionSequence {
 pub struct State(BTreeMap<Address, Account>);
 
 impl State {
-    /// Write the state to the database.
-    pub fn write_to_db(&self, tx: &impl DbTxMut) -> Result<(), Error> {
-        for (&address, account) in &self.0 {
-            let hashed_address = keccak256(address);
-            let has_code = !account.code.is_empty();
-            let code_hash = has_code.then(|| keccak256(&account.code));
-            let reth_account = RethAccount {
-                balance: account.balance,
-                nonce: account.nonce.to::<u64>(),
-                bytecode_hash: code_hash,
-            };
-            tx.put::<tables::PlainAccountState>(address, reth_account)?;
-            tx.put::<tables::HashedAccounts>(hashed_address, reth_account)?;
-            if let Some(code_hash) = code_hash {
-                tx.put::<tables::Bytecodes>(code_hash, Bytecode::new_raw(account.code.clone()))?;
-            }
-            account.storage.iter().filter(|(_, v)| !v.is_zero()).try_for_each(|(k, v)| {
-                let storage_key = B256::from_slice(&k.to_be_bytes::<32>());
-                tx.put::<tables::PlainStorageState>(
-                    address,
-                    StorageEntry { key: storage_key, value: *v },
-                )?;
-                tx.put::<tables::HashedStorages>(
-                    hashed_address,
-                    StorageEntry { key: keccak256(storage_key), value: *v },
-                )
-            })?;
-        }
-
-        Ok(())
+    /// Return state as genesis state.
+    pub fn into_genesis_state(self) -> BTreeMap<Address, GenesisAccount> {
+        self.0
+            .into_iter()
+            .map(|(address, account)| {
+                let storage = account
+                    .storage
+                    .iter()
+                    .filter(|(_, v)| !v.is_zero())
+                    .map(|(k, v)| {
+                        (
+                            B256::from_slice(&k.to_be_bytes::<32>()),
+                            B256::from_slice(&v.to_be_bytes::<32>()),
+                        )
+                    })
+                    .collect();
+                let account = GenesisAccount {
+                    balance: account.balance,
+                    nonce: Some(account.nonce.try_into().unwrap()),
+                    code: Some(account.code).filter(|c| !c.is_empty()),
+                    storage: Some(storage),
+                    private_key: None,
+                };
+                (address, account)
+            })
+            .collect::<BTreeMap<_, _>>()
     }
 }
 
@@ -212,9 +214,12 @@ impl Account {
     ///
     /// In case of a mismatch, `Err(Error::Assertion)` is returned.
     pub fn assert_db(&self, address: Address, tx: &impl DbTx) -> Result<(), Error> {
-        let account = tx.get::<tables::PlainAccountState>(address)?.ok_or_else(|| {
-            Error::Assertion(format!("Expected account ({address}) is missing from DB: {self:?}"))
-        })?;
+        let account =
+            tx.get_by_encoded_key::<tables::PlainAccountState>(&address)?.ok_or_else(|| {
+                Error::Assertion(format!(
+                    "Expected account ({address}) is missing from DB: {self:?}"
+                ))
+            })?;
 
         assert_equal(self.balance, account.balance, "Balance does not match")?;
         assert_equal(self.nonce.to(), account.nonce, "Nonce does not match")?;
@@ -265,7 +270,7 @@ pub enum ForkSpec {
     FrontierToHomesteadAt5,
     /// Homestead
     Homestead,
-    /// Homestead to Tangerine
+    /// Homestead to DAO
     HomesteadToDaoAt5,
     /// Homestead to Tangerine
     HomesteadToEIP150At5,
@@ -294,9 +299,14 @@ pub enum ForkSpec {
     /// London
     London,
     /// Paris aka The Merge
+    #[serde(alias = "Paris")]
     Merge,
+    /// Paris to Shanghai at time 15k
+    ParisToShanghaiAtTime15k,
     /// Shanghai
     Shanghai,
+    /// Shanghai to Cancun at time 15k
+    ShanghaiToCancunAtTime15k,
     /// Merge EOF test
     #[serde(alias = "Merge+3540+3670")]
     MergeEOF,
@@ -308,43 +318,80 @@ pub enum ForkSpec {
     MergePush0,
     /// Cancun
     Cancun,
-    /// Fork Spec which is unknown to us
-    #[serde(other)]
-    Unknown,
+    /// Cancun to Prague at time 15k
+    CancunToPragueAtTime15k,
+    /// Prague
+    Prague,
+    /// Osaka
+    Osaka,
 }
 
-impl From<ForkSpec> for ChainSpec {
-    fn from(fork_spec: ForkSpec) -> Self {
-        let spec_builder = ChainSpecBuilder::mainnet();
+impl ForkSpec {
+    /// Converts this EF fork spec to a Reth [`ChainSpec`].
+    pub fn to_chain_spec(self) -> Arc<ChainSpec> {
+        static MAP: OnceLock<RwLock<HashMap<ForkSpec, Arc<ChainSpec>>>> = OnceLock::new();
+        let map = MAP.get_or_init(Default::default);
+        if let Some(r) = map.read().unwrap().get(&self) {
+            return r.clone();
+        }
+        map.write()
+            .unwrap()
+            .entry(self)
+            .or_insert_with(|| Arc::new(self.to_chain_spec_inner()))
+            .clone()
+    }
 
-        match fork_spec {
-            ForkSpec::Frontier => spec_builder.frontier_activated(),
-            ForkSpec::Homestead | ForkSpec::FrontierToHomesteadAt5 => {
-                spec_builder.homestead_activated()
+    fn to_chain_spec_inner(self) -> ChainSpec {
+        let spec_builder = ChainSpecBuilder::mainnet().reset();
+
+        match self {
+            Self::Frontier => spec_builder.frontier_activated(),
+            Self::FrontierToHomesteadAt5 => spec_builder
+                .frontier_activated()
+                .with_fork(EthereumHardfork::Homestead, ForkCondition::Block(5)),
+            Self::Homestead => spec_builder.homestead_activated(),
+            Self::HomesteadToDaoAt5 => spec_builder
+                .homestead_activated()
+                .with_fork(EthereumHardfork::Dao, ForkCondition::Block(5)),
+            Self::HomesteadToEIP150At5 => spec_builder
+                .homestead_activated()
+                .with_fork(EthereumHardfork::Tangerine, ForkCondition::Block(5)),
+            Self::EIP150 => spec_builder.tangerine_whistle_activated(),
+            Self::EIP158 => spec_builder.spurious_dragon_activated(),
+            Self::EIP158ToByzantiumAt5 => spec_builder
+                .spurious_dragon_activated()
+                .with_fork(EthereumHardfork::Byzantium, ForkCondition::Block(5)),
+            Self::Byzantium => spec_builder.byzantium_activated(),
+            Self::ByzantiumToConstantinopleAt5 => spec_builder
+                .byzantium_activated()
+                .with_fork(EthereumHardfork::Constantinople, ForkCondition::Block(5)),
+            Self::ByzantiumToConstantinopleFixAt5 => spec_builder
+                .byzantium_activated()
+                .with_fork(EthereumHardfork::Petersburg, ForkCondition::Block(5)),
+            Self::Constantinople => spec_builder.constantinople_activated(),
+            Self::ConstantinopleFix => spec_builder.petersburg_activated(),
+            Self::Istanbul => spec_builder.istanbul_activated(),
+            Self::Berlin => spec_builder.berlin_activated(),
+            Self::BerlinToLondonAt5 => spec_builder
+                .berlin_activated()
+                .with_fork(EthereumHardfork::London, ForkCondition::Block(5)),
+            Self::London => spec_builder.london_activated(),
+            Self::Merge | Self::MergeEOF | Self::MergeMeterInitCode | Self::MergePush0 => {
+                spec_builder.paris_activated()
             }
-            ForkSpec::EIP150 | ForkSpec::HomesteadToDaoAt5 | ForkSpec::HomesteadToEIP150At5 => {
-                spec_builder.tangerine_whistle_activated()
-            }
-            ForkSpec::EIP158 => spec_builder.spurious_dragon_activated(),
-            ForkSpec::Byzantium |
-            ForkSpec::EIP158ToByzantiumAt5 |
-            ForkSpec::ConstantinopleFix |
-            ForkSpec::ByzantiumToConstantinopleFixAt5 => spec_builder.byzantium_activated(),
-            ForkSpec::Istanbul => spec_builder.istanbul_activated(),
-            ForkSpec::Berlin => spec_builder.berlin_activated(),
-            ForkSpec::London | ForkSpec::BerlinToLondonAt5 => spec_builder.london_activated(),
-            ForkSpec::Merge |
-            ForkSpec::MergeEOF |
-            ForkSpec::MergeMeterInitCode |
-            ForkSpec::MergePush0 => spec_builder.paris_activated(),
-            ForkSpec::Shanghai => spec_builder.shanghai_activated(),
-            ForkSpec::Cancun => spec_builder.cancun_activated(),
-            ForkSpec::ByzantiumToConstantinopleAt5 | ForkSpec::Constantinople => {
-                panic!("Overridden with PETERSBURG")
-            }
-            ForkSpec::Unknown => {
-                panic!("Unknown fork");
-            }
+            Self::ParisToShanghaiAtTime15k => spec_builder
+                .paris_activated()
+                .with_fork(EthereumHardfork::Shanghai, ForkCondition::Timestamp(15_000)),
+            Self::Shanghai => spec_builder.shanghai_activated(),
+            Self::ShanghaiToCancunAtTime15k => spec_builder
+                .shanghai_activated()
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(15_000)),
+            Self::Cancun => spec_builder.cancun_activated(),
+            Self::CancunToPragueAtTime15k => spec_builder
+                .cancun_activated()
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(15_000)),
+            Self::Prague => spec_builder.prague_activated(),
+            Self::Osaka => spec_builder.osaka_activated(),
         }
         .build()
     }

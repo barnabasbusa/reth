@@ -57,21 +57,31 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Common types used throughout the abstraction.
 pub mod common;
+
 /// Cursor database traits.
 pub mod cursor;
+
 /// Database traits.
 pub mod database;
+
 /// Database metrics trait extensions.
 pub mod database_metrics;
+
 pub mod mock;
+
 /// Table traits
 pub mod table;
+
+pub mod tables;
+pub use tables::*;
+
 /// Transaction database traits.
 pub mod transaction;
+
 /// Re-exports
 pub use reth_storage_errors::db::{DatabaseError, DatabaseWriteOperation};
 

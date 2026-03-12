@@ -7,16 +7,17 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// The Engine API implementation.
 mod engine_api;
 
+/// Reth-specific engine API extensions.
+mod reth_engine_api;
+
 /// Engine API capabilities.
 pub mod capabilities;
-
-/// The Engine API message type.
-mod message;
+pub use capabilities::EngineCapabilities;
 
 /// Engine API error.
 mod error;
@@ -26,13 +27,12 @@ mod metrics;
 
 pub use engine_api::{EngineApi, EngineApiSender};
 pub use error::*;
-pub use message::EngineApiMessageVersion;
+pub use reth_engine_api::RethEngineApi;
 
 // re-export server trait for convenience
 pub use reth_rpc_api::EngineApiServer;
 
 #[cfg(test)]
-#[allow(unused_imports)]
 mod tests {
     // silence unused import warning
     use alloy_rlp as _;

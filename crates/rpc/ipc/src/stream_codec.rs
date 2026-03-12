@@ -27,7 +27,7 @@
 // This basis of this file has been taken from the deprecated jsonrpc codebase:
 // https://github.com/paritytech/jsonrpc
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use std::{io, str};
 
 /// Separator for enveloping messages in streaming codecs
@@ -83,7 +83,7 @@ impl tokio_util::codec::Decoder for StreamCodec {
 
                 match str::from_utf8(line.as_ref()) {
                     Ok(s) => Ok(Some(s.to_string())),
-                    Err(_) => Err(io::Error::new(io::ErrorKind::Other, "invalid UTF-8")),
+                    Err(_) => Err(io::Error::other("invalid UTF-8")),
                 }
             } else {
                 Ok(None)
@@ -113,11 +113,11 @@ impl tokio_util::codec::Decoder for StreamCodec {
                 is_escaped = byte == b'\\' && !is_escaped && in_str;
 
                 if depth == 0 && idx != start_idx && idx - start_idx + 1 > whitespaces {
-                    let bts = buf.split_to(idx + 1);
-                    return match String::from_utf8(bts.into()) {
-                        Ok(val) => Ok(Some(val)),
-                        Err(_) => Ok(None),
+                    if start_idx > 0 {
+                        buf.advance(start_idx);
                     }
+                    let bts = buf.split_to(idx + 1 - start_idx);
+                    return Ok(String::from_utf8(bts.into()).ok())
                 }
             }
             Ok(None)
@@ -209,15 +209,14 @@ mod tests {
         let request2 = codec
             .decode(&mut buf)
             .expect("There should be no error in first 2nd test")
-            .expect("There should be aa request in 2nd whitespace test");
-        // TODO: maybe actually trim it out
-        assert_eq!(request2, "\n\n\n\n{ test: 2 }");
+            .expect("There should be a request in 2nd whitespace test");
+        assert_eq!(request2, "{ test: 2 }");
 
         let request3 = codec
             .decode(&mut buf)
             .expect("There should be no error in first 3rd test")
             .expect("There should be a request in 3rd whitespace test");
-        assert_eq!(request3, "\n\r{\n test: 3 }");
+        assert_eq!(request3, "{\n test: 3 }");
 
         let request4 = codec.decode(&mut buf).expect("There should be no error in first 4th test");
         assert!(
@@ -254,8 +253,7 @@ mod tests {
 
     #[test]
     fn huge() {
-        let request = r#"
-		{
+        let request = r#"{
 			"jsonrpc":"2.0",
 			"method":"say_hello",
 			"params": [
@@ -299,5 +297,19 @@ mod tests {
 
         assert_eq!(request, "{ test: 1 }");
         assert_eq!(request2, "{ test: 2 }");
+    }
+
+    #[test]
+    fn serde_json_accepts_whitespace_wrapped_json() {
+        let json = "   { \"key\": \"value\" }   ";
+
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Obj {
+            key: String,
+        }
+
+        let parsed: Result<Obj, _> = serde_json::from_str(json);
+        assert!(parsed.is_ok(), "serde_json should accept whitespace-wrapped JSON");
+        assert_eq!(parsed.unwrap(), Obj { key: "value".into() });
     }
 }

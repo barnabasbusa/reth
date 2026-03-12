@@ -1,20 +1,24 @@
 use alloy_primitives::{keccak256, B256};
 use itertools::Itertools;
 use reth_config::config::{EtlConfig, HashingConfig};
-use reth_db::{tables, RawKey, RawTable, RawValue};
 use reth_db_api::{
     cursor::{DbCursorRO, DbCursorRW},
+    tables,
     transaction::{DbTx, DbTxMut},
+    RawKey, RawTable, RawValue,
 };
 use reth_etl::Collector;
-use reth_primitives::Account;
-use reth_provider::{AccountExtReader, DBProvider, HashingWriter, StatsReader};
+use reth_primitives_traits::Account;
+use reth_provider::{
+    AccountExtReader, DBProvider, HashingWriter, StatsReader, StorageSettingsCache,
+};
 use reth_stages_api::{
-    AccountHashingCheckpoint, EntitiesCheckpoint, ExecInput, ExecOutput, Stage, StageCheckpoint,
-    StageError, StageId, UnwindInput, UnwindOutput,
+    AccountHashingCheckpoint, BlockRangeOutput, EntitiesCheckpoint, ExecInput, ExecOutput, Stage,
+    StageCheckpoint, StageError, StageId, UnwindInput, UnwindOutput,
 };
 use reth_storage_errors::provider::ProviderResult;
 use std::{
+    collections::BTreeSet,
     fmt::Debug,
     ops::{Range, RangeInclusive},
     sync::mpsc::{self, Receiver},
@@ -36,6 +40,9 @@ pub struct AccountHashingStage {
     pub clean_threshold: u64,
     /// The maximum number of accounts to process before committing during unwind.
     pub commit_threshold: u64,
+    /// The maximum number of changeset entries to process before committing. The stage commits
+    /// after either `commit_threshold` blocks or `commit_entries` entries, whichever comes first.
+    pub commit_entries: u64,
     /// ETL configuration
     pub etl_config: EtlConfig,
 }
@@ -46,6 +53,7 @@ impl AccountHashingStage {
         Self {
             clean_threshold: config.clean_threshold,
             commit_threshold: config.commit_threshold,
+            commit_entries: config.commit_entries,
             etl_config,
         }
     }
@@ -58,16 +66,19 @@ impl AccountHashingStage {
     ///
     /// Proceeds to go to the `BlockTransitionIndex` end, go back `transitions` and change the
     /// account state in the `AccountChangeSets` table.
-    pub fn seed<
-        Tx: DbTx + DbTxMut + 'static,
-        Spec: Send + Sync + 'static + reth_chainspec::EthereumHardforks,
-    >(
-        provider: &reth_provider::DatabaseProvider<Tx, Spec>,
+    pub fn seed<Tx: DbTx + DbTxMut + 'static, N: reth_provider::providers::ProviderNodeTypes>(
+        provider: &reth_provider::DatabaseProvider<Tx, N>,
         opts: SeedOpts,
-    ) -> Result<Vec<(alloy_primitives::Address, reth_primitives::Account)>, StageError> {
+    ) -> Result<Vec<(alloy_primitives::Address, Account)>, StageError>
+    where
+        N::Primitives: reth_primitives_traits::NodePrimitives<
+            Block = reth_ethereum_primitives::Block,
+            BlockHeader = reth_primitives_traits::Header,
+        >,
+    {
         use alloy_primitives::U256;
         use reth_db_api::models::AccountBeforeTx;
-        use reth_provider::{StaticFileProviderFactory, StaticFileWriter};
+        use reth_provider::{BlockWriter, StaticFileProviderFactory, StaticFileWriter};
         use reth_testing_utils::{
             generators,
             generators::{random_block_range, random_eoa_accounts, BlockRangeParams},
@@ -82,11 +93,11 @@ impl AccountHashingStage {
         );
 
         for block in blocks {
-            provider.insert_historical_block(block.try_seal_with_senders().unwrap()).unwrap();
+            provider.insert_block(&block.try_recover().unwrap()).unwrap();
         }
         provider
             .static_file_provider()
-            .latest_writer(reth_primitives::StaticFileSegment::Headers)
+            .latest_writer(reth_static_file_types::StaticFileSegment::Headers)
             .unwrap()
             .commit()
             .unwrap();
@@ -95,9 +106,9 @@ impl AccountHashingStage {
             // Account State generator
             let mut account_cursor =
                 provider.tx_ref().cursor_write::<tables::PlainAccountState>()?;
-            accounts.sort_by(|a, b| a.0.cmp(&b.0));
+            accounts.sort_by_key(|a| a.0);
             for (addr, acc) in &accounts {
-                account_cursor.append(*addr, *acc)?;
+                account_cursor.append(*addr, acc)?;
             }
 
             let mut acc_changeset_cursor =
@@ -110,7 +121,7 @@ impl AccountHashingStage {
                     bytecode_hash: None,
                 };
                 let acc_before_tx = AccountBeforeTx { address: *addr, info: Some(prev_acc) };
-                acc_changeset_cursor.append(t, acc_before_tx)?;
+                acc_changeset_cursor.append(t, &acc_before_tx)?;
             }
         }
 
@@ -123,6 +134,7 @@ impl Default for AccountHashingStage {
         Self {
             clean_threshold: 500_000,
             commit_threshold: 100_000,
+            commit_entries: 30_000_000,
             etl_config: EtlConfig::default(),
         }
     }
@@ -130,7 +142,11 @@ impl Default for AccountHashingStage {
 
 impl<Provider> Stage<Provider> for AccountHashingStage
 where
-    Provider: DBProvider<Tx: DbTxMut> + HashingWriter + AccountExtReader + StatsReader,
+    Provider: DBProvider<Tx: DbTxMut>
+        + HashingWriter
+        + AccountExtReader
+        + StatsReader
+        + StorageSettingsCache,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -138,21 +154,33 @@ where
     }
 
     /// Execute the stage.
+    ///
+    /// When `use_hashed_state` is enabled, this stage is a no-op because the execution stage
+    /// writes directly to `HashedAccounts`. Otherwise, it hashes plain state to populate hashed
+    /// tables.
     fn execute(&mut self, provider: &Provider, input: ExecInput) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
             return Ok(ExecOutput::done(input.checkpoint()))
         }
 
-        let (from_block, to_block) = input.next_block_range().into_inner();
+        // If using hashed state as canonical, execution already writes to `HashedAccounts`,
+        // so this stage becomes a no-op.
+        if provider.cached_storage_settings().use_hashed_state() {
+            return Ok(ExecOutput::done(input.checkpoint().with_block_number(input.target())));
+        }
 
-        // if there are more blocks then threshold it is faster to go over Plain state and hash all
-        // account otherwise take changesets aggregate the sets and apply hashing to
-        // AccountHashing table. Also, if we start from genesis, we need to hash from scratch, as
-        // genesis accounts are not in changeset.
-        if to_block - from_block > self.clean_threshold || from_block == 1 {
+        // Use the total remaining range to decide clean vs incremental.
+        let total_range = input.target() - input.checkpoint().block_number;
+        let from_block = input.next_block();
+
+        if total_range > self.clean_threshold || from_block == 1 {
+            // if there are more blocks than threshold it is faster to go over Plain state and
+            // hash all accounts otherwise take changesets aggregate the sets and apply
+            // hashing to HashedAccounts table. Also, if we start from genesis, we need to
+            // hash from scratch, as genesis accounts are not in changeset.
             let tx = provider.tx_ref();
 
-            // clear table, load all accounts and hash it
+            // clear table, load all accounts and hash them
             tx.clear::<tables::HashedAccounts>()?;
 
             let mut accounts_cursor = tx.cursor_read::<RawTable<tables::PlainAccountState>>()?;
@@ -163,10 +191,9 @@ where
             // channels used to return result of account hashing
             for chunk in &accounts_cursor.walk(None)?.chunks(WORKER_CHUNK_SIZE) {
                 // An _unordered_ channel to receive results from a rayon job
-                let (tx, rx) = mpsc::channel();
-                channels.push(rx);
-
                 let chunk = chunk.collect::<Result<Vec<_>, _>>()?;
+                let (tx, rx) = mpsc::sync_channel(chunk.len());
+                channels.push(rx);
                 // Spawn the hashing task onto the global rayon pool
                 rayon::spawn(move || {
                     for (address, account) in chunk {
@@ -176,7 +203,7 @@ where
                 });
 
                 // Flush to ETL when channels length reaches MAXIMUM_CHANNELS
-                if !channels.is_empty() && channels.len() % MAXIMUM_CHANNELS == 0 {
+                if !channels.is_empty() && channels.len().is_multiple_of(MAXIMUM_CHANNELS) {
                     collect(&mut channels, &mut collector)?;
                 }
             }
@@ -189,7 +216,7 @@ where
             let total_hashes = collector.len();
             let interval = (total_hashes / 10).max(1);
             for (index, item) in collector.iter()?.enumerate() {
-                if index > 0 && index % interval == 0 {
+                if index > 0 && index.is_multiple_of(interval) {
                     info!(
                         target: "sync::stages::hashing_account",
                         progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
@@ -199,29 +226,59 @@ where
 
                 let (key, value) = item?;
                 hashed_account_cursor
-                    .append(RawKey::<B256>::from_vec(key), RawValue::<Account>::from_vec(value))?;
+                    .append(RawKey::<B256>::from_vec(key), &RawValue::<Account>::from_vec(value))?;
             }
+
+            let checkpoint = StageCheckpoint::new(input.target())
+                .with_account_hashing_stage_checkpoint(AccountHashingCheckpoint {
+                    progress: stage_checkpoint_progress(provider)?,
+                    ..Default::default()
+                });
+
+            Ok(ExecOutput { checkpoint, done: true })
         } else {
-            // Aggregate all transition changesets and make a list of accounts that have been
-            // changed.
-            let lists = provider.changed_accounts_with_range(from_block..=to_block)?;
-            // Iterate over plain state and get newest value.
-            // Assumption we are okay to make is that plainstate represent
-            // `previous_stage_progress` state.
-            let accounts = provider.basic_accounts(lists)?;
-            // Insert and hash accounts to hashing table
+            // Stream changesets entry-by-entry, bounded by both block count
+            // (commit_threshold) and entry count (commit_entries), whichever comes first.
+            let BlockRangeOutput { block_range, is_final_range } =
+                input.next_block_range_with_threshold(self.commit_threshold);
+            let (from_block, to_block) = block_range.into_inner();
+
+            let tx = provider.tx_ref();
+            let mut changeset_cursor = tx.cursor_read::<tables::AccountChangeSets>()?;
+            let mut changed = BTreeSet::new();
+            let mut total_entries = 0u64;
+            let mut last_block = from_block;
+
+            for entry in changeset_cursor.walk_range(from_block..=to_block)? {
+                let (block_number, account_before) = entry?;
+
+                // Check the entry limit only at block boundaries so we never
+                // checkpoint mid-block (which would skip the remaining entries
+                // for that block on the next invocation).
+                if block_number != last_block && total_entries >= self.commit_entries {
+                    break;
+                }
+
+                last_block = block_number;
+                changed.insert(account_before.address);
+                total_entries += 1;
+            }
+
+            let accounts = provider.basic_accounts(changed)?;
             provider.insert_account_for_hashing(accounts)?;
+
+            let exhausted = total_entries < self.commit_entries;
+            let done = exhausted && is_final_range;
+            let progress_block = if exhausted { to_block } else { last_block };
+
+            let checkpoint = StageCheckpoint::new(progress_block)
+                .with_account_hashing_stage_checkpoint(AccountHashingCheckpoint {
+                    progress: stage_checkpoint_progress(provider)?,
+                    ..Default::default()
+                });
+
+            Ok(ExecOutput { checkpoint, done })
         }
-
-        // We finished the hashing stage, no future iterations is expected for the same block range,
-        // so no checkpoint is needed.
-        let checkpoint = StageCheckpoint::new(input.target())
-            .with_account_hashing_stage_checkpoint(AccountHashingCheckpoint {
-                progress: stage_checkpoint_progress(provider)?,
-                ..Default::default()
-            });
-
-        Ok(ExecOutput { checkpoint, done: true })
     }
 
     /// Unwind the stage.
@@ -230,11 +287,15 @@ where
         provider: &Provider,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
+        // NOTE: this runs in both v1 and v2 mode. In v2 mode, execution writes
+        // directly to `HashedAccounts`, but the unwind must still revert those
+        // entries here because `MerkleUnwind` runs after this stage (in unwind
+        // order) and needs `HashedAccounts` to reflect the target block state
+        // before it can verify the state root.
         let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
-        // Aggregate all transition changesets and make a list of accounts that have been changed.
-        provider.unwind_account_hashing(range)?;
+        provider.unwind_account_hashing_range(range)?;
 
         let mut stage_checkpoint =
             input.checkpoint.account_hashing_stage_checkpoint().unwrap_or_default();
@@ -300,7 +361,7 @@ mod tests {
     };
     use alloy_primitives::U256;
     use assert_matches::assert_matches;
-    use reth_primitives::Account;
+    use reth_primitives_traits::Account;
     use reth_provider::providers::StaticFileWriter;
     use reth_stages_api::StageUnitCheckpoint;
     use test_utils::*;
@@ -340,7 +401,7 @@ mod tests {
                 done: true,
             }) if block_number == previous_stage &&
                 processed == total &&
-                total == runner.db.table::<tables::PlainAccountState>().unwrap().len() as u64
+                total == runner.db.count_entries::<tables::PlainAccountState>().unwrap() as u64
         );
 
         // Validate the stage execution
@@ -357,6 +418,7 @@ mod tests {
             pub(crate) db: TestStageDB,
             commit_threshold: u64,
             clean_threshold: u64,
+            commit_entries: u64,
             etl_config: EtlConfig,
         }
 
@@ -365,7 +427,7 @@ mod tests {
                 self.clean_threshold = threshold;
             }
 
-            #[allow(dead_code)]
+            #[expect(dead_code)]
             pub(crate) fn set_commit_threshold(&mut self, threshold: u64) {
                 self.commit_threshold = threshold;
             }
@@ -421,6 +483,7 @@ mod tests {
                     db: TestStageDB::default(),
                     commit_threshold: 1000,
                     clean_threshold: 1000,
+                    commit_entries: u64::MAX,
                     etl_config: EtlConfig::default(),
                 }
             }
@@ -437,6 +500,7 @@ mod tests {
                 Self::S {
                     commit_threshold: self.commit_threshold,
                     clean_threshold: self.clean_threshold,
+                    commit_entries: self.commit_entries,
                     etl_config: self.etl_config.clone(),
                 }
             }
@@ -449,7 +513,7 @@ mod tests {
                 let provider = self.db.factory.database_provider_rw()?;
                 let res = Ok(AccountHashingStage::seed(
                     &provider,
-                    SeedOpts { blocks: 1..=input.target(), accounts: 10, txs: 0..3 },
+                    SeedOpts { blocks: 0..=input.target(), accounts: 10, txs: 0..3 },
                 )
                 .unwrap());
                 provider.commit().expect("failed to commit");

@@ -1,9 +1,18 @@
-use reth_db_api::{database::Database, transaction::DbTx};
+use alloc::vec::Vec;
+use core::ops::{Bound, RangeBounds};
+use reth_db_api::{
+    common::KeyValue,
+    cursor::DbCursorRO,
+    database::Database,
+    table::Table,
+    transaction::{DbTx, DbTxMut},
+    DatabaseError,
+};
 use reth_prune_types::PruneModes;
 use reth_storage_errors::provider::ProviderResult;
 
 /// Database provider.
-pub trait DBProvider: Send + Sync + Sized + 'static {
+pub trait DBProvider: Sized {
     /// Underlying database transaction held by the provider.
     type Tx: DbTx;
 
@@ -28,12 +37,105 @@ pub trait DBProvider: Send + Sync + Sized + 'static {
     }
 
     /// Commit database transaction
-    fn commit(self) -> ProviderResult<bool> {
-        Ok(self.into_tx().commit()?)
-    }
+    fn commit(self) -> ProviderResult<()>;
 
     /// Returns a reference to prune modes.
     fn prune_modes_ref(&self) -> &PruneModes;
+
+    /// Return full table as Vec
+    fn table<T: Table>(&self) -> Result<Vec<KeyValue<T>>, DatabaseError>
+    where
+        T::Key: Default + Ord,
+    {
+        self.tx_ref()
+            .cursor_read::<T>()?
+            .walk(Some(T::Key::default()))?
+            .collect::<Result<Vec<_>, DatabaseError>>()
+    }
+
+    /// Return a list of entries from the table, based on the given range.
+    #[inline]
+    fn get<T: Table>(
+        &self,
+        range: impl RangeBounds<T::Key>,
+    ) -> Result<Vec<KeyValue<T>>, DatabaseError> {
+        self.tx_ref().cursor_read::<T>()?.walk_range(range)?.collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Iterates over read only values in the given table and collects them into a vector.
+    ///
+    /// Early-returns if the range is empty, without opening a cursor transaction.
+    fn cursor_read_collect<T: Table<Key = u64>>(
+        &self,
+        range: impl RangeBounds<T::Key>,
+    ) -> ProviderResult<Vec<T::Value>> {
+        let capacity = match range_size_hint(&range) {
+            Some(0) | None => return Ok(Vec::new()),
+            Some(capacity) => capacity,
+        };
+        let mut cursor = self.tx_ref().cursor_read::<T>()?;
+        self.cursor_collect_with_capacity(&mut cursor, range, capacity)
+    }
+
+    /// Iterates over read only values in the given table and collects them into a vector.
+    fn cursor_collect<T: Table<Key = u64>>(
+        &self,
+        cursor: &mut impl DbCursorRO<T>,
+        range: impl RangeBounds<T::Key>,
+    ) -> ProviderResult<Vec<T::Value>> {
+        let capacity = range_size_hint(&range).unwrap_or(0);
+        self.cursor_collect_with_capacity(cursor, range, capacity)
+    }
+
+    /// Iterates over read only values in the given table and collects them into a vector with
+    /// capacity.
+    fn cursor_collect_with_capacity<T: Table<Key = u64>>(
+        &self,
+        cursor: &mut impl DbCursorRO<T>,
+        range: impl RangeBounds<T::Key>,
+        capacity: usize,
+    ) -> ProviderResult<Vec<T::Value>> {
+        let mut items = Vec::with_capacity(capacity);
+        for entry in cursor.walk_range(range)? {
+            items.push(entry?.1);
+        }
+        Ok(items)
+    }
+
+    /// Remove list of entries from the table. Returns the number of entries removed.
+    #[inline]
+    fn remove<T: Table>(&self, range: impl RangeBounds<T::Key>) -> Result<usize, DatabaseError>
+    where
+        Self::Tx: DbTxMut,
+    {
+        let mut entries = 0;
+        let mut cursor_write = self.tx_ref().cursor_write::<T>()?;
+        let mut walker = cursor_write.walk_range(range)?;
+        while walker.next().transpose()?.is_some() {
+            walker.delete_current()?;
+            entries += 1;
+        }
+        Ok(entries)
+    }
+
+    /// Return a list of entries from the table, and remove them, based on the given range.
+    #[inline]
+    fn take<T: Table>(
+        &self,
+        range: impl RangeBounds<T::Key>,
+    ) -> Result<Vec<KeyValue<T>>, DatabaseError>
+    where
+        Self::Tx: DbTxMut,
+    {
+        let mut cursor_write = self.tx_ref().cursor_write::<T>()?;
+        let mut walker = cursor_write.walk_range(range)?;
+        let mut items = Vec::new();
+        while let Some(i) = walker.next().transpose()? {
+            walker.delete_current()?;
+            items.push(i)
+        }
+        Ok(items)
+    }
 }
 
 /// Database provider factory.
@@ -53,4 +155,45 @@ pub trait DatabaseProviderFactory: Send + Sync {
 
     /// Create new read-write database provider.
     fn database_provider_rw(&self) -> ProviderResult<Self::ProviderRW>;
+}
+
+/// Helper type alias to get the associated transaction type from a [`DatabaseProviderFactory`].
+pub type FactoryTx<F> = <<F as DatabaseProviderFactory>::DB as Database>::TX;
+
+/// A trait which can be used to describe any factory-like type which returns a read-only provider.
+pub trait DatabaseProviderROFactory {
+    /// Provider type returned by this factory.
+    ///
+    /// This type is intentionally left unconstrained; constraints can be added as-needed when this
+    /// is used.
+    type Provider;
+
+    /// Creates and returns a Provider.
+    fn database_provider_ro(&self) -> ProviderResult<Self::Provider>;
+}
+
+impl<T> DatabaseProviderROFactory for T
+where
+    T: DatabaseProviderFactory,
+{
+    type Provider = T::Provider;
+
+    fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
+        <T as DatabaseProviderFactory>::database_provider_ro(self)
+    }
+}
+
+/// Returns the length of the range if the range has a bounded end.
+pub fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
+    let start = match range.start_bound().cloned() {
+        Bound::Included(start) => start,
+        Bound::Excluded(start) => start.checked_add(1)?,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound().cloned() {
+        Bound::Included(end) => end.saturating_add(1),
+        Bound::Excluded(end) => end,
+        Bound::Unbounded => return None,
+    };
+    end.checked_sub(start).map(|x| x as _)
 }

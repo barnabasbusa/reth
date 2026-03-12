@@ -57,7 +57,7 @@ where
     }
 
     /// Returns a mutable reference to the handler
-    pub fn handler_mut(&mut self) -> &mut T {
+    pub const fn handler_mut(&mut self) -> &mut T {
         &mut self.handler
     }
 
@@ -71,7 +71,7 @@ where
     /// Internal function used to advance the chain.
     ///
     /// Polls the `ChainOrchestrator` for the next event.
-    #[tracing::instrument(level = "debug", name = "ChainOrchestrator::poll", skip(self, cx))]
+    #[tracing::instrument(level = "debug", target = "engine::tree::chain_orchestrator", skip_all)]
     fn poll_next_event(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ChainEvent<T::Event>> {
         let this = self.get_mut();
 
@@ -117,7 +117,6 @@ where
                         HandlerEvent::BackfillAction(action) => {
                             // forward action to backfill_sync
                             this.backfill_sync.on_action(action);
-                            continue 'outer
                         }
                         HandlerEvent::Event(ev) => {
                             // bubble up the event
@@ -220,10 +219,19 @@ pub enum HandlerEvent<T> {
 }
 
 /// Internal events issued by the [`ChainOrchestrator`].
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum FromOrchestrator {
     /// Invoked when backfill sync finished
     BackfillSyncFinished(ControlFlow),
     /// Invoked when backfill sync started
     BackfillSyncStarted,
+    /// Gracefully terminate the engine service.
+    ///
+    /// When this variant is received, the engine will persist all remaining in-memory blocks
+    /// to disk before shutting down. Once persistence is complete, a signal is sent through
+    /// the oneshot channel to notify the caller.
+    Terminate {
+        /// Channel to signal termination completion.
+        tx: tokio::sync::oneshot::Sender<()>,
+    },
 }

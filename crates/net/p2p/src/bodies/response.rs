@@ -1,43 +1,58 @@
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockNumber, U256};
-use reth_primitives::{SealedBlock, SealedHeader};
-
+use reth_primitives_traits::{Block, InMemorySize, SealedBlock, SealedHeader};
 /// The block response
 #[derive(PartialEq, Eq, Debug, Clone)]
-pub enum BlockResponse {
+pub enum BlockResponse<B: Block> {
     /// Full block response (with transactions or ommers)
-    Full(SealedBlock),
+    Full(SealedBlock<B>),
     /// The empty block response
-    Empty(SealedHeader),
+    Empty(SealedHeader<B::Header>),
 }
 
-impl BlockResponse {
-    /// Return the reference to the response header
-    pub const fn header(&self) -> &SealedHeader {
+impl<B> BlockResponse<B>
+where
+    B: Block,
+{
+    /// Return the block number
+    pub fn block_number(&self) -> BlockNumber {
         match self {
-            Self::Full(block) => &block.header,
-            Self::Empty(header) => header,
+            Self::Full(block) => block.number(),
+            Self::Empty(header) => header.number(),
         }
     }
 
-    /// Calculates a heuristic for the in-memory size of the [`BlockResponse`].
+    /// Return the difficulty of the response header
+    pub fn difficulty(&self) -> U256 {
+        match self {
+            Self::Full(block) => block.difficulty(),
+            Self::Empty(header) => header.difficulty(),
+        }
+    }
+
+    /// Return the reference to the response body
+    pub fn into_body(self) -> Option<B::Body> {
+        match self {
+            Self::Full(block) => Some(block.into_body()),
+            Self::Empty(_) => None,
+        }
+    }
+
+    /// Return the reference to the response body
+    pub const fn body(&self) -> Option<&B::Body> {
+        match self {
+            Self::Full(block) => Some(block.body()),
+            Self::Empty(_) => None,
+        }
+    }
+}
+
+impl<B: Block> InMemorySize for BlockResponse<B> {
     #[inline]
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         match self {
             Self::Full(block) => SealedBlock::size(block),
             Self::Empty(header) => SealedHeader::size(header),
-        }
-    }
-
-    /// Return the block number
-    pub fn block_number(&self) -> BlockNumber {
-        self.header().number
-    }
-
-    /// Return the reference to the response header
-    pub fn difficulty(&self) -> U256 {
-        match self {
-            Self::Full(block) => block.difficulty,
-            Self::Empty(header) => header.difficulty,
         }
     }
 }

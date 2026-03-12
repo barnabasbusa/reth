@@ -5,14 +5,16 @@ use crate::{
     PayloadBuilderHandle, PayloadBuilderService, PayloadJob, PayloadJobGenerator,
 };
 
+use alloy_consensus::Block;
 use alloy_primitives::U256;
-use reth_chain_state::ExecutedBlock;
-use reth_payload_primitives::{PayloadBuilderError, PayloadKind, PayloadTypes};
-use reth_primitives::Block;
-use reth_provider::CanonStateNotification;
+use reth_chain_state::CanonStateNotification;
+use reth_payload_builder_primitives::PayloadBuilderError;
+use reth_payload_primitives::{PayloadKind, PayloadTypes};
+use reth_primitives_traits::Block as _;
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -63,7 +65,7 @@ impl PayloadJobGenerator for TestPayloadJobGenerator {
     }
 }
 
-/// A [`PayloadJobGenerator`] for testing purposes
+/// A [`PayloadJob`] for testing purposes
 #[derive(Debug)]
 pub struct TestPayloadJob {
     attr: EthPayloadBuilderAttributes,
@@ -86,15 +88,18 @@ impl PayloadJob for TestPayloadJob {
     fn best_payload(&self) -> Result<EthBuiltPayload, PayloadBuilderError> {
         Ok(EthBuiltPayload::new(
             self.attr.payload_id(),
-            Block::default().seal_slow(),
+            Arc::new(Block::<_>::default().seal_slow()),
             U256::ZERO,
-            Some(ExecutedBlock::default()),
             Some(Default::default()),
         ))
     }
 
     fn payload_attributes(&self) -> Result<EthPayloadBuilderAttributes, PayloadBuilderError> {
         Ok(self.attr.clone())
+    }
+
+    fn payload_timestamp(&self) -> Result<u64, PayloadBuilderError> {
+        Ok(self.attr.timestamp)
     }
 
     fn resolve_kind(

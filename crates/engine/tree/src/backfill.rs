@@ -10,7 +10,7 @@
 use futures::FutureExt;
 use reth_provider::providers::ProviderNodeTypes;
 use reth_stages_api::{ControlFlow, Pipeline, PipelineError, PipelineTarget, PipelineWithResult};
-use reth_tasks::TaskSpawner;
+use reth_tasks::Runtime;
 use std::task::{ready, Context, Poll};
 use tokio::sync::oneshot;
 use tracing::trace;
@@ -47,7 +47,7 @@ impl BackfillSyncState {
 }
 
 /// Backfill sync mode functionality.
-pub trait BackfillSync: Send + Sync {
+pub trait BackfillSync: Send {
     /// Performs a backfill action.
     fn on_action(&mut self, action: BackfillAction);
 
@@ -80,7 +80,7 @@ pub enum BackfillEvent {
 #[derive(Debug)]
 pub struct PipelineSync<N: ProviderNodeTypes> {
     /// The type that can spawn the pipeline task.
-    pipeline_task_spawner: Box<dyn TaskSpawner>,
+    pipeline_task_spawner: Runtime,
     /// The current state of the pipeline.
     /// The pipeline is used for large ranges.
     pipeline_state: PipelineState<N>,
@@ -90,16 +90,16 @@ pub struct PipelineSync<N: ProviderNodeTypes> {
 
 impl<N: ProviderNodeTypes> PipelineSync<N> {
     /// Create a new instance.
-    pub fn new(pipeline: Pipeline<N>, pipeline_task_spawner: Box<dyn TaskSpawner>) -> Self {
+    pub fn new(pipeline: Pipeline<N>, pipeline_task_spawner: Runtime) -> Self {
         Self {
             pipeline_task_spawner,
-            pipeline_state: PipelineState::Idle(Some(pipeline)),
+            pipeline_state: PipelineState::Idle(Some(Box::new(pipeline))),
             pending_pipeline_target: None,
         }
     }
 
     /// Returns `true` if a pipeline target is queued and will be triggered on the next `poll`.
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     const fn is_pipeline_sync_pending(&self) -> bool {
         self.pending_pipeline_target.is_some() && self.pipeline_state.is_idle()
     }
@@ -138,12 +138,12 @@ impl<N: ProviderNodeTypes> PipelineSync<N> {
                 let (tx, rx) = oneshot::channel();
 
                 let pipeline = pipeline.take().expect("exists");
-                self.pipeline_task_spawner.spawn_critical_blocking(
+                self.pipeline_task_spawner.spawn_critical_blocking_task(
                     "pipeline task",
-                    Box::pin(async move {
+                    async move {
                         let result = pipeline.run_as_fut(Some(target)).await;
                         let _ = tx.send(result);
-                    }),
+                    },
                 );
                 self.pipeline_state = PipelineState::Running(rx);
 
@@ -165,7 +165,7 @@ impl<N: ProviderNodeTypes> PipelineSync<N> {
         };
         let ev = match res {
             Ok((pipeline, result)) => {
-                self.pipeline_state = PipelineState::Idle(Some(pipeline));
+                self.pipeline_state = PipelineState::Idle(Some(Box::new(pipeline)));
                 BackfillEvent::Finished(result)
             }
             Err(why) => {
@@ -214,7 +214,7 @@ impl<N: ProviderNodeTypes> BackfillSync for PipelineSync<N> {
 #[derive(Debug)]
 enum PipelineState<N: ProviderNodeTypes> {
     /// Pipeline is idle.
-    Idle(Option<Pipeline<N>>),
+    Idle(Option<Box<Pipeline<N>>>),
     /// Pipeline is running and waiting for a response
     Running(oneshot::Receiver<PipelineWithResult<N>>),
 }
@@ -230,16 +230,18 @@ impl<N: ProviderNodeTypes> PipelineState<N> {
 mod tests {
     use super::*;
     use crate::test_utils::{insert_headers_into_client, TestPipelineBuilder};
-    use alloy_primitives::{BlockNumber, Sealable, B256};
+    use alloy_consensus::Header;
+    use alloy_eips::eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M;
+    use alloy_primitives::{BlockNumber, B256};
     use assert_matches::assert_matches;
     use futures::poll;
     use reth_chainspec::{ChainSpecBuilder, MAINNET};
     use reth_network_p2p::test_utils::TestFullBlockClient;
-    use reth_primitives::{Header, SealedHeader};
+    use reth_primitives_traits::SealedHeader;
     use reth_provider::test_utils::MockNodeTypesWithDB;
     use reth_stages::ExecOutput;
     use reth_stages_api::StageCheckpoint;
-    use reth_tasks::TokioTaskExecutor;
+    use reth_tasks::Runtime;
     use std::{collections::VecDeque, future::poll_fn, sync::Arc};
 
     struct TestHarness {
@@ -263,18 +265,16 @@ mod tests {
                     checkpoint: StageCheckpoint::new(BlockNumber::from(pipeline_done_after)),
                     done: true,
                 })]))
-                .build(chain_spec.clone());
+                .build(chain_spec);
 
-            let pipeline_sync = PipelineSync::new(pipeline, Box::<TokioTaskExecutor>::default());
+            let pipeline_sync = PipelineSync::new(pipeline, Runtime::test());
             let client = TestFullBlockClient::default();
-            let sealed = Header {
+            let header = Header {
                 base_fee_per_gas: Some(7),
-                gas_limit: chain_spec.max_gas_limit,
+                gas_limit: ETHEREUM_BLOCK_GAS_LIMIT_30M,
                 ..Default::default()
-            }
-            .seal_slow();
-            let (header, seal) = sealed.into_parts();
-            let header = SealedHeader::new(header, seal);
+            };
+            let header = SealedHeader::seal_slow(header);
             insert_headers_into_client(&client, header, 0..total_blocks);
 
             let tip = client.highest_block().expect("there should be blocks here").hash();

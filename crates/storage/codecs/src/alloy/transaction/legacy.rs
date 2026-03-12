@@ -6,10 +6,11 @@ use alloy_primitives::{Bytes, ChainId, TxKind, U256};
 
 /// Legacy transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Compact)]
+#[reth_codecs(crate = "crate")]
 #[cfg_attr(
     any(test, feature = "test-utils"),
     derive(arbitrary::Arbitrary, serde::Serialize, serde::Deserialize),
-    crate::add_arbitrary_tests(compact)
+    crate::add_arbitrary_tests(crate, compact)
 )]
 #[cfg_attr(feature = "test-utils", allow(unreachable_pub), visibility::make(pub))]
 pub(crate) struct TxLegacy {
@@ -41,7 +42,7 @@ pub(crate) struct TxLegacy {
     value: U256,
     /// Input has two uses depending if transaction is Create or Call (if `to` field is None or
     /// Some). pub init: An unlimited size byte array specifying the
-    /// EVM-code for the account initialisation procedure CREATE,
+    /// EVM-code for the account initialization procedure CREATE,
     /// data: An unlimited size byte array specifying the
     /// input data of the message call, formally Td.
     input: Bytes,
@@ -66,7 +67,8 @@ impl Compact for AlloyTxLegacy {
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let (tx, _) = TxLegacy::from_compact(buf, len);
+        // Return the remaining slice from the inner from_compact to advance the cursor correctly.
+        let (tx, remaining) = TxLegacy::from_compact(buf, len);
 
         let alloy_tx = Self {
             chain_id: tx.chain_id,
@@ -78,6 +80,6 @@ impl Compact for AlloyTxLegacy {
             input: tx.input,
         };
 
-        (alloy_tx, buf)
+        (alloy_tx, remaining)
     }
 }

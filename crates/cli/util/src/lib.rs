@@ -6,19 +6,23 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "tracy-allocator")]
+use reth_tracing as _;
 
 pub mod allocator;
+pub mod cancellation;
 
 /// Helper function to load a secret key from a file.
 pub mod load_secret_key;
-pub use load_secret_key::get_secret_key;
+pub use load_secret_key::{get_secret_key, parse_secret_key_from_hex};
 
 /// Cli parsers functions.
 pub mod parsers;
 pub use parsers::{
     hash_or_num_value_parser, parse_duration_from_secs, parse_duration_from_secs_or_ms,
-    parse_socket_address,
+    parse_ether_value, parse_socket_address,
 };
 
 #[cfg(all(unix, any(target_env = "gnu", target_os = "macos")))]

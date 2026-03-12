@@ -6,20 +6,14 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-use once_cell as _;
-#[cfg(not(feature = "std"))]
-pub(crate) use once_cell::sync::{Lazy as LazyLock, OnceCell as OnceLock};
-#[cfg(feature = "std")]
-pub(crate) use std::sync::{LazyLock, OnceLock};
-
 /// Chain specific constants
-pub(crate) mod constants;
-pub use constants::MIN_TRANSACTION_GAS;
+mod constants;
+pub use constants::*;
 
 mod api;
 /// The chain info module.
@@ -31,14 +25,18 @@ pub use alloy_chains::{Chain, ChainKind, NamedChain};
 /// Re-export for convenience
 pub use reth_ethereum_forks::*;
 
+pub use alloy_evm::EvmLimitParams;
 pub use api::EthChainSpec;
 pub use info::ChainInfo;
 #[cfg(any(test, feature = "test-utils"))]
 pub use spec::test_fork_ids;
 pub use spec::{
+    blob_params_to_schedule, create_chain_config, mainnet_chain_config, make_genesis_header,
     BaseFeeParams, BaseFeeParamsKind, ChainSpec, ChainSpecBuilder, ChainSpecProvider,
-    DepositContract, ForkBaseFeeParams, DEV, HOLESKY, MAINNET, SEPOLIA,
+    DepositContract, ForkBaseFeeParams, DEV, HOLESKY, HOODI, MAINNET, SEPOLIA,
 };
+
+use reth_primitives_traits::sync::OnceLock;
 
 /// Simple utility to create a thread-safe sync cell with a value set.
 pub fn once_cell_set<T>(value: T) -> OnceLock<T> {
@@ -148,5 +146,35 @@ mod tests {
         let s = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.holesky.ethdisco.net";
         let chain: Chain = NamedChain::Holesky.into();
         assert_eq!(s, chain.public_dns_network_protocol().unwrap().as_str());
+    }
+
+    #[test]
+    fn test_centralized_base_fee_calculation() {
+        use crate::{ChainSpec, EthChainSpec};
+        use alloy_consensus::Header;
+        use alloy_eips::eip1559::INITIAL_BASE_FEE;
+
+        fn parent_header() -> Header {
+            Header {
+                gas_used: 15_000_000,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: Some(INITIAL_BASE_FEE),
+                timestamp: 1_000,
+                ..Default::default()
+            }
+        }
+
+        let spec = ChainSpec::default();
+        let parent = parent_header();
+
+        // For testing, assume next block has timestamp 12 seconds later
+        let next_timestamp = parent.timestamp + 12;
+
+        let expected = parent
+            .next_block_base_fee(spec.base_fee_params_at_timestamp(next_timestamp))
+            .unwrap_or_default();
+
+        let got = spec.next_block_base_fee(&parent, next_timestamp).unwrap_or_default();
+        assert_eq!(expected, got, "Base fee calculation does not match expected value");
     }
 }

@@ -2,29 +2,36 @@
 //!
 //! Run with
 //!
-//! ```not_rust
+//! ```sh
 //! cargo run -p manual-p2p
 //! ```
+
+#![warn(unused_crate_dependencies)]
 
 use std::time::Duration;
 
 use alloy_consensus::constants::MAINNET_GENESIS_HASH;
 use futures::StreamExt;
-use reth_chainspec::{Chain, MAINNET};
 use reth_discv4::{DiscoveryUpdate, Discv4, Discv4ConfigBuilder, DEFAULT_DISCOVERY_ADDRESS};
 use reth_ecies::stream::ECIESStream;
-use reth_eth_wire::{
-    EthMessage, EthStream, HelloMessage, P2PStream, Status, UnauthedEthStream, UnauthedP2PStream,
+use reth_ethereum::{
+    chainspec::{Chain, EthereumHardfork, Head, MAINNET},
+    network::{
+        config::rng_secret_key,
+        eth_wire::{
+            EthMessage, EthStream, HelloMessage, P2PStream, UnauthedEthStream, UnauthedP2PStream,
+            UnifiedStatus,
+        },
+        EthNetworkPrimitives,
+    },
 };
-use reth_network::config::rng_secret_key;
 use reth_network_peers::{mainnet_nodes, pk2id, NodeRecord};
-use reth_primitives::{EthereumHardfork, Head};
 use secp256k1::{SecretKey, SECP256K1};
 use std::sync::LazyLock;
 use tokio::net::TcpStream;
 
 type AuthedP2PStream = P2PStream<ECIESStream<TcpStream>>;
-type AuthedEthStream = EthStream<P2PStream<ECIESStream<TcpStream>>>;
+type AuthedEthStream = EthStream<P2PStream<ECIESStream<TcpStream>>, EthNetworkPrimitives>;
 
 pub static MAINNET_BOOT_NODES: LazyLock<Vec<NodeRecord>> = LazyLock::new(mainnet_nodes);
 
@@ -94,30 +101,35 @@ async fn handshake_p2p(
 }
 
 // Perform a ETH Wire handshake with a peer
-async fn handshake_eth(p2p_stream: AuthedP2PStream) -> eyre::Result<(AuthedEthStream, Status)> {
+async fn handshake_eth(
+    p2p_stream: AuthedP2PStream,
+) -> eyre::Result<(AuthedEthStream, UnifiedStatus)> {
     let fork_filter = MAINNET.fork_filter(Head {
         timestamp: MAINNET.fork(EthereumHardfork::Shanghai).as_timestamp().unwrap(),
         ..Default::default()
     });
 
-    let status = Status::builder()
+    let unified_status = UnifiedStatus::builder()
         .chain(Chain::mainnet())
         .genesis(MAINNET_GENESIS_HASH)
         .forkid(MAINNET.hardfork_fork_id(EthereumHardfork::Shanghai).unwrap())
         .build();
 
-    let status = Status { version: p2p_stream.shared_capabilities().eth()?.version(), ..status };
+    let status = UnifiedStatus {
+        version: p2p_stream.shared_capabilities().eth()?.version().try_into()?,
+        ..unified_status
+    };
     let eth_unauthed = UnauthedEthStream::new(p2p_stream);
     Ok(eth_unauthed.handshake(status, fork_filter).await?)
 }
 
 // Snoop by greedily capturing all broadcasts that the peer emits
-// note: this node cannot handle request so will be disconnected by peer when challenged
+// note: this node cannot handle request so it will be disconnected by peer when challenged
 async fn snoop(peer: NodeRecord, mut eth_stream: AuthedEthStream) {
     while let Some(Ok(update)) = eth_stream.next().await {
         match update {
             EthMessage::NewPooledTransactionHashes66(txs) => {
-                println!("Got {} new tx hashes from peer {}", txs.0.len(), peer.address);
+                println!("Got {} new tx hashes from peer {}", txs.len(), peer.address);
             }
             EthMessage::NewBlock(block) => {
                 println!("Got new block data {:?} from peer {}", block, peer.address);
@@ -126,11 +138,7 @@ async fn snoop(peer: NodeRecord, mut eth_stream: AuthedEthStream) {
                 println!("Got {} new tx hashes from peer {}", txs.hashes.len(), peer.address);
             }
             EthMessage::NewBlockHashes(block_hashes) => {
-                println!(
-                    "Got {} new block hashes from peer {}",
-                    block_hashes.0.len(),
-                    peer.address
-                );
+                println!("Got {} new block hashes from peer {}", block_hashes.len(), peer.address);
             }
             EthMessage::GetNodeData(_) => {
                 println!("Unable to serve GetNodeData request to peer {}", peer.address);

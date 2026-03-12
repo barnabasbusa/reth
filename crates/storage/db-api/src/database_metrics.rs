@@ -37,38 +37,18 @@ pub trait DatabaseMetrics {
 
 impl<DB: DatabaseMetrics> DatabaseMetrics for Arc<DB> {
     fn report_metrics(&self) {
-        <DB as DatabaseMetrics>::report_metrics(self)
-    }
-}
-
-/// The type used to store metadata about the database.
-#[derive(Debug, Default)]
-pub struct DatabaseMetadataValue {
-    /// The freelist size
-    freelist_size: Option<usize>,
-}
-
-impl DatabaseMetadataValue {
-    /// Creates a new [`DatabaseMetadataValue`] with the given freelist size.
-    pub const fn new(freelist_size: Option<usize>) -> Self {
-        Self { freelist_size }
+        DB::report_metrics(self)
     }
 
-    /// Returns the freelist size, if available.
-    pub const fn freelist_size(&self) -> Option<usize> {
-        self.freelist_size
+    fn gauge_metrics(&self) -> Vec<(&'static str, f64, Vec<Label>)> {
+        DB::gauge_metrics(self)
     }
-}
 
-/// Includes a method to return a [`DatabaseMetadataValue`] type, which can be used to dynamically
-/// retrieve information about the database.
-pub trait DatabaseMetadata {
-    /// Returns a metadata type, [`DatabaseMetadataValue`] for the database.
-    fn metadata(&self) -> DatabaseMetadataValue;
-}
+    fn counter_metrics(&self) -> Vec<(&'static str, u64, Vec<Label>)> {
+        DB::counter_metrics(self)
+    }
 
-impl<DB: DatabaseMetadata> DatabaseMetadata for Arc<DB> {
-    fn metadata(&self) -> DatabaseMetadataValue {
-        <DB as DatabaseMetadata>::metadata(self)
+    fn histogram_metrics(&self) -> Vec<(&'static str, f64, Vec<Label>)> {
+        DB::histogram_metrics(self)
     }
 }

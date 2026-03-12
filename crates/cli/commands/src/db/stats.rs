@@ -1,23 +1,30 @@
-use crate::db::checksum::ChecksumViewer;
+use crate::{common::CliNodeTypes, db::checksum::ChecksumViewer};
 use clap::Parser;
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::WrapErr;
 use human_bytes::human_bytes;
 use itertools::Itertools;
 use reth_chainspec::EthereumHardforks;
-use reth_db::{mdbx, static_file::iter_static_files, DatabaseEnv, TableViewer, Tables};
-use reth_db_api::database::Database;
+use reth_db::{mdbx, static_file::iter_static_files, DatabaseEnv};
+use reth_db_api::{database::Database, TableViewer, Tables};
 use reth_db_common::DbTool;
 use reth_fs_util as fs;
-use reth_node_builder::{NodeTypesWithDB, NodeTypesWithDBAdapter, NodeTypesWithEngine};
+use reth_node_builder::{NodePrimitives, NodeTypesWithDB, NodeTypesWithDBAdapter};
 use reth_node_core::dirs::{ChainPath, DataDirPath};
-use reth_provider::providers::{ProviderNodeTypes, StaticFileProvider};
+use reth_provider::{
+    providers::{ProviderNodeTypes, StaticFileProvider},
+    RocksDBProviderFactory,
+};
 use reth_static_file_types::SegmentRangeInclusive;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 /// The arguments for the `reth db stats` command
 pub struct Command {
+    /// Skip consistency checks for static files.
+    #[arg(long, default_value_t = false)]
+    pub(crate) skip_consistency_checks: bool,
+
     /// Show only the total size for static files.
     #[arg(long, default_value_t = false)]
     detailed_sizes: bool,
@@ -38,10 +45,10 @@ pub struct Command {
 
 impl Command {
     /// Execute `db stats` command
-    pub fn execute<N: NodeTypesWithEngine<ChainSpec: EthereumHardforks>>(
+    pub fn execute<N: CliNodeTypes<ChainSpec: EthereumHardforks>>(
         self,
         data_dir: ChainPath<DataDirPath>,
-        tool: &DbTool<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
+        tool: &DbTool<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
     ) -> eyre::Result<()> {
         if self.checksum {
             let checksum_report = self.checksum_report(tool)?;
@@ -49,7 +56,7 @@ impl Command {
             println!("\n");
         }
 
-        let static_files_stats_table = self.static_files_stats_table(data_dir)?;
+        let static_files_stats_table = self.static_files_stats_table::<N::Primitives>(data_dir)?;
         println!("{static_files_stats_table}");
 
         println!("\n");
@@ -57,10 +64,15 @@ impl Command {
         let db_stats_table = self.db_stats_table(tool)?;
         println!("{db_stats_table}");
 
+        println!("\n");
+
+        let rocksdb_stats_table = self.rocksdb_stats_table(tool);
+        println!("{rocksdb_stats_table}");
+
         Ok(())
     }
 
-    fn db_stats_table<N: NodeTypesWithDB<DB = Arc<DatabaseEnv>>>(
+    fn db_stats_table<N: NodeTypesWithDB<DB = DatabaseEnv>>(
         &self,
         tool: &DbTool<N>,
     ) -> eyre::Result<ComfyTable> {
@@ -80,11 +92,11 @@ impl Command {
             db_tables.sort();
             let mut total_size = 0;
             for db_table in db_tables {
-                let table_db = tx.inner.open_db(Some(db_table)).wrap_err("Could not open db.")?;
+                let table_db = tx.inner().open_db(Some(db_table)).wrap_err("Could not open db.")?;
 
                 let stats = tx
-                    .inner
-                    .db_stat(&table_db)
+                    .inner()
+                    .db_stat(table_db.dbi())
                     .wrap_err(format!("Could not find table: {db_table}"))?;
 
                 // Defaults to 16KB right now but we should
@@ -124,8 +136,9 @@ impl Command {
                 .add_cell(Cell::new(human_bytes(total_size as f64)));
             table.add_row(row);
 
-            let freelist = tx.inner.env().freelist()?;
-            let pagesize = tx.inner.db_stat(&mdbx::Database::freelist_db())?.page_size() as usize;
+            let freelist = tx.inner().env().freelist()?;
+            let pagesize =
+                tx.inner().db_stat(mdbx::Database::freelist_db().dbi())?.page_size() as usize;
             let freelist_size = freelist * pagesize;
 
             let mut row = Row::new();
@@ -143,7 +156,71 @@ impl Command {
         Ok(table)
     }
 
-    fn static_files_stats_table(
+    fn rocksdb_stats_table<N: NodeTypesWithDB>(&self, tool: &DbTool<N>) -> ComfyTable {
+        let mut table = ComfyTable::new();
+        table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+        table.set_header([
+            "RocksDB Table Name",
+            "# Entries",
+            "SST Size",
+            "Memtable Size",
+            "Total Size",
+            "Pending Compaction",
+        ]);
+
+        let stats = tool.provider_factory.rocksdb_provider().table_stats();
+        let mut total_sst: u64 = 0;
+        let mut total_memtable: u64 = 0;
+        let mut total_size: u64 = 0;
+        let mut total_pending: u64 = 0;
+
+        for stat in &stats {
+            total_sst += stat.sst_size_bytes;
+            total_memtable += stat.memtable_size_bytes;
+            total_size += stat.estimated_size_bytes;
+            total_pending += stat.pending_compaction_bytes;
+            let mut row = Row::new();
+            row.add_cell(Cell::new(&stat.name))
+                .add_cell(Cell::new(stat.estimated_num_keys))
+                .add_cell(Cell::new(human_bytes(stat.sst_size_bytes as f64)))
+                .add_cell(Cell::new(human_bytes(stat.memtable_size_bytes as f64)))
+                .add_cell(Cell::new(human_bytes(stat.estimated_size_bytes as f64)))
+                .add_cell(Cell::new(human_bytes(stat.pending_compaction_bytes as f64)));
+            table.add_row(row);
+        }
+
+        if !stats.is_empty() {
+            let max_widths = table.column_max_content_widths();
+            let mut separator = Row::new();
+            for width in max_widths {
+                separator.add_cell(Cell::new("-".repeat(width as usize)));
+            }
+            table.add_row(separator);
+
+            let mut row = Row::new();
+            row.add_cell(Cell::new("RocksDB Total"))
+                .add_cell(Cell::new(""))
+                .add_cell(Cell::new(human_bytes(total_sst as f64)))
+                .add_cell(Cell::new(human_bytes(total_memtable as f64)))
+                .add_cell(Cell::new(human_bytes(total_size as f64)))
+                .add_cell(Cell::new(human_bytes(total_pending as f64)));
+            table.add_row(row);
+
+            let wal_size = tool.provider_factory.rocksdb_provider().wal_size_bytes();
+            let mut row = Row::new();
+            row.add_cell(Cell::new("WAL"))
+                .add_cell(Cell::new(""))
+                .add_cell(Cell::new(""))
+                .add_cell(Cell::new(""))
+                .add_cell(Cell::new(human_bytes(wal_size as f64)))
+                .add_cell(Cell::new(""));
+            table.add_row(row);
+        }
+
+        table
+    }
+
+    fn static_files_stats_table<N: NodePrimitives>(
         &self,
         data_dir: ChainPath<DataDirPath>,
     ) -> eyre::Result<ComfyTable> {
@@ -172,8 +249,9 @@ impl Command {
             ]);
         }
 
-        let static_files = iter_static_files(data_dir.static_files())?;
-        let static_file_provider = StaticFileProvider::read_only(data_dir.static_files(), false)?;
+        let static_files = iter_static_files(&data_dir.static_files())?;
+        let static_file_provider =
+            StaticFileProvider::<N>::read_only(data_dir.static_files(), false)?;
 
         let mut total_data_size = 0;
         let mut total_index_size = 0;
@@ -190,10 +268,11 @@ impl Command {
                 mut segment_config_size,
             ) = (0, 0, 0, 0, 0, 0);
 
-            for (block_range, tx_range) in &ranges {
-                let fixed_block_range = static_file_provider.find_fixed_range(block_range.start());
+            for (block_range, header) in &ranges {
+                let fixed_block_range =
+                    static_file_provider.find_fixed_range(segment, block_range.start());
                 let jar_provider = static_file_provider
-                    .get_segment_provider(segment, || Some(fixed_block_range), None)?
+                    .get_segment_provider_for_range(segment, || Some(fixed_block_range), None)?
                     .ok_or_else(|| {
                         eyre::eyre!("Failed to get segment provider for segment: {}", segment)
                     })?;
@@ -219,7 +298,7 @@ impl Command {
                     row.add_cell(Cell::new(segment))
                         .add_cell(Cell::new(format!("{block_range}")))
                         .add_cell(Cell::new(
-                            tx_range.map_or("N/A".to_string(), |tx_range| format!("{tx_range}")),
+                            header.tx_range().map_or("N/A".to_string(), |range| format!("{range}")),
                         ))
                         .add_cell(Cell::new(format!("{columns} x {rows}")));
                     if self.detailed_sizes {
@@ -269,10 +348,12 @@ impl Command {
                 let tx_range = {
                     let start = ranges
                         .iter()
-                        .find_map(|(_, tx_range)| tx_range.map(|r| r.start()))
+                        .find_map(|(_, header)| header.tx_range().map(|range| range.start()))
                         .unwrap_or_default();
-                    let end =
-                        ranges.iter().rev().find_map(|(_, tx_range)| tx_range.map(|r| r.end()));
+                    let end = ranges
+                        .iter()
+                        .rev()
+                        .find_map(|(_, header)| header.tx_range().map(|range| range.end()));
                     end.map(|end| SegmentRangeInclusive::new(start, end))
                 };
 
@@ -342,8 +423,8 @@ impl Command {
             // add rows containing checksums to the table
             let mut row = Row::new();
             row.add_cell(Cell::new(db_table));
-            row.add_cell(Cell::new(format!("{:x}", checksum)));
-            row.add_cell(Cell::new(format!("{:?}", elapsed)));
+            row.add_cell(Cell::new(format!("{checksum:x}")));
+            row.add_cell(Cell::new(format!("{elapsed:?}")));
             table.add_row(row);
         }
 
@@ -359,7 +440,7 @@ impl Command {
         let mut row = Row::new();
         row.add_cell(Cell::new("Total elapsed"));
         row.add_cell(Cell::new(""));
-        row.add_cell(Cell::new(format!("{:?}", total_elapsed)));
+        row.add_cell(Cell::new(format!("{total_elapsed:?}")));
         table.add_row(row);
 
         Ok(table)

@@ -2,23 +2,28 @@
 //!
 //! Run with
 //!
-//! ```not_rust
+//! ```sh
 //! cargo run -p example-custom-rlpx-subprotocol -- node
 //! ```
 //!
-//! This launch a regular reth node with a custom rlpx subprotocol.
+//! This launches a regular reth node with a custom rlpx subprotocol.
+
+#![warn(unused_crate_dependencies)]
 
 mod subprotocol;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-use reth::builder::NodeHandle;
-use reth_network::{
-    config::SecretKey, protocol::IntoRlpxSubProtocol, NetworkConfig, NetworkManager,
-    NetworkProtocols,
+use reth_ethereum::{
+    network::{
+        api::{test_utils::PeersHandleProvider, NetworkInfo},
+        config::rng_secret_key,
+        protocol::IntoRlpxSubProtocol,
+        NetworkConfig, NetworkManager, NetworkProtocols,
+    },
+    node::{builder::NodeHandle, EthereumNode},
+    tasks::Runtime,
 };
-use reth_network_api::{test_utils::PeersHandleProvider, NetworkInfo};
-use reth_node_ethereum::EthereumNode;
 use subprotocol::{
     connection::CustomCommand,
     protocol::{
@@ -30,7 +35,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
 fn main() -> eyre::Result<()> {
-    reth::cli::Cli::parse_args().run(|builder, _args| async move {
+    reth_ethereum::cli::Cli::parse_args().run(async move |builder, _args| {
         // launch the node
         let NodeHandle { node, node_exit_future } =
             builder.node(EthereumNode::default()).launch().await?;
@@ -43,21 +48,21 @@ fn main() -> eyre::Result<()> {
         node.network.add_rlpx_sub_protocol(custom_rlpx_handler.into_rlpx_sub_protocol());
 
         // creates a separate network instance and adds the custom network subprotocol
-        let secret_key = SecretKey::new(&mut rand::thread_rng());
+        let secret_key = rng_secret_key();
         let (tx, mut from_peer1) = mpsc::unbounded_channel();
         let custom_rlpx_handler_2 = CustomRlpxProtoHandler { state: ProtocolState { events: tx } };
-        let net_cfg = NetworkConfig::builder(secret_key)
+        let net_cfg = NetworkConfig::builder(secret_key, Runtime::test())
             .listener_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
             .disable_discovery()
             .add_rlpx_sub_protocol(custom_rlpx_handler_2.into_rlpx_sub_protocol())
             .build_with_noop_provider(node.chain_spec());
 
         // spawn the second network instance
-        let subnetwork = NetworkManager::new(net_cfg).await?;
+        let subnetwork = NetworkManager::eth(net_cfg).await?;
         let subnetwork_peer_id = *subnetwork.peer_id();
         let subnetwork_peer_addr = subnetwork.local_addr();
         let subnetwork_handle = subnetwork.peers_handle();
-        node.task_executor.spawn(subnetwork);
+        node.task_executor.spawn_task(subnetwork);
 
         // connect the launched node to the subnetwork
         node.network.peers_handle().add_peer(subnetwork_peer_id, subnetwork_peer_addr);

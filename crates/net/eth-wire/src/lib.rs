@@ -11,17 +11,21 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod capability;
 mod disconnect;
 pub mod errors;
+pub mod eth_snap_stream;
 mod ethstream;
 mod hello;
 pub mod multiplex;
 mod p2pstream;
 mod pinger;
 pub mod protocol;
+
+/// Handshake logic
+pub mod handshake;
 
 #[cfg(test)]
 pub mod test_utils;
@@ -33,10 +37,10 @@ pub use tokio_util::codec::{
 
 pub use crate::{
     disconnect::CanDisconnect,
-    ethstream::{EthStream, UnauthedEthStream, MAX_MESSAGE_SIZE},
+    ethstream::{EthStream, EthStreamInner, UnauthedEthStream, MAX_MESSAGE_SIZE},
     hello::{HelloMessage, HelloMessageBuilder, HelloMessageWithProtocols},
     p2pstream::{
-        DisconnectP2P, P2PMessage, P2PMessageID, P2PStream, UnauthedP2PStream,
+        DisconnectP2P, P2PMessage, P2PMessageID, P2PStream, UnauthedP2PStream, HANDSHAKE_TIMEOUT,
         MAX_RESERVED_MESSAGE_ID,
     },
     Capability, ProtocolVersion,

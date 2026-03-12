@@ -1,8 +1,9 @@
 use crate::Tables;
-use metrics::{Gauge, Histogram};
+use metrics::Histogram;
+use quanta::Instant;
 use reth_metrics::{metrics::Counter, Metrics};
 use rustc_hash::FxHashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
 const LARGE_VALUE_THRESHOLD_BYTES: usize = 4096;
@@ -104,10 +105,11 @@ impl DatabaseEnvMetrics {
         value_size: Option<usize>,
         f: impl FnOnce() -> R,
     ) -> R {
-        self.operations
-            .get(&(table, operation))
-            .expect("operation & table metric handle not found")
-            .record(value_size, f)
+        if let Some(metrics) = self.operations.get(&(table, operation)) {
+            metrics.record(value_size, f)
+        } else {
+            f()
+        }
     }
 
     /// Record metrics for opening a database transaction.
@@ -196,8 +198,10 @@ impl TransactionOutcome {
 pub(crate) enum Operation {
     /// Database get operation.
     Get,
-    /// Database put operation.
-    Put,
+    /// Database put upsert operation.
+    PutUpsert,
+    /// Database put append operation.
+    PutAppend,
     /// Database delete operation.
     Delete,
     /// Database cursor upsert operation.
@@ -219,7 +223,8 @@ impl Operation {
     pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Get => "get",
-            Self::Put => "put",
+            Self::PutUpsert => "put-upsert",
+            Self::PutAppend => "put-append",
             Self::Delete => "delete",
             Self::CursorUpsert => "cursor-upsert",
             Self::CursorInsert => "cursor-insert",
@@ -258,17 +263,19 @@ impl Labels {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "database.transaction")]
 pub(crate) struct TransactionMetrics {
-    /// Total number of currently open database transactions
-    open_total: Gauge,
+    /// Total number of opened database transactions (cumulative)
+    opened_total: Counter,
+    /// Total number of closed database transactions (cumulative)
+    closed_total: Counter,
 }
 
 impl TransactionMetrics {
     pub(crate) fn record_open(&self) {
-        self.open_total.increment(1.0);
+        self.opened_total.increment(1);
     }
 
     pub(crate) fn record_close(&self) {
-        self.open_total.decrement(1.0);
+        self.closed_total.increment(1);
     }
 }
 
@@ -347,7 +354,7 @@ impl OperationMetrics {
 
         // Record duration only for large values to prevent the performance hit of clock syscall
         // on small operations
-        if value_size.map_or(false, |size| size > LARGE_VALUE_THRESHOLD_BYTES) {
+        if value_size.is_some_and(|size| size > LARGE_VALUE_THRESHOLD_BYTES) {
             let start = Instant::now();
             let result = f();
             self.large_value_duration_seconds.record(start.elapsed());

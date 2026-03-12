@@ -1,13 +1,15 @@
 use alloy_primitives::BlockNumber;
 use futures::Stream;
-use futures_util::{FutureExt, StreamExt};
+use futures_util::StreamExt;
 use pin_project::pin_project;
 use reth_network_p2p::{
     bodies::downloader::{BodyDownloader, BodyDownloaderResult},
     error::DownloadResult,
 };
-use reth_tasks::{TaskSpawner, TokioTaskExecutor};
+use reth_primitives_traits::Block;
+use reth_tasks::Runtime;
 use std::{
+    fmt::Debug,
     future::Future,
     ops::RangeInclusive,
     pin::Pin,
@@ -23,53 +25,18 @@ pub const BODIES_TASK_BUFFER_SIZE: usize = 4;
 /// A [BodyDownloader] that drives a spawned [BodyDownloader] on a spawned task.
 #[derive(Debug)]
 #[pin_project]
-pub struct TaskDownloader {
+pub struct TaskDownloader<B: Block> {
     #[pin]
-    from_downloader: ReceiverStream<BodyDownloaderResult>,
+    from_downloader: ReceiverStream<BodyDownloaderResult<B>>,
     to_downloader: UnboundedSender<RangeInclusive<BlockNumber>>,
 }
 
-// === impl TaskDownloader ===
-
-impl TaskDownloader {
-    /// Spawns the given `downloader` via [`tokio::task::spawn`] returns a [`TaskDownloader`] that's
-    /// connected to that task.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if called outside of a Tokio runtime
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use reth_consensus::Consensus;
-    /// use reth_downloaders::bodies::{bodies::BodiesDownloaderBuilder, task::TaskDownloader};
-    /// use reth_network_p2p::bodies::client::BodiesClient;
-    /// use reth_storage_api::HeaderProvider;
-    /// use std::sync::Arc;
-    ///
-    /// fn t<B: BodiesClient + 'static, Provider: HeaderProvider + Unpin + 'static>(
-    ///     client: Arc<B>,
-    ///     consensus: Arc<dyn Consensus>,
-    ///     provider: Provider,
-    /// ) {
-    ///     let downloader = BodiesDownloaderBuilder::default().build(client, consensus, provider);
-    ///     let downloader = TaskDownloader::spawn(downloader);
-    /// }
-    /// ```
-    pub fn spawn<T>(downloader: T) -> Self
-    where
-        T: BodyDownloader + 'static,
-    {
-        Self::spawn_with(downloader, &TokioTaskExecutor::default())
-    }
-
-    /// Spawns the given `downloader` via the given [`TaskSpawner`] returns a [`TaskDownloader`]
+impl<B: Block + 'static> TaskDownloader<B> {
+    /// Spawns the given `downloader` via the given [`Runtime`] and returns a [`TaskDownloader`]
     /// that's connected to that task.
-    pub fn spawn_with<T, S>(downloader: T, spawner: &S) -> Self
+    pub fn spawn_with<T>(downloader: T, runtime: &Runtime) -> Self
     where
-        T: BodyDownloader + 'static,
-        S: TaskSpawner,
+        T: BodyDownloader<Block = B> + 'static,
     {
         let (bodies_tx, bodies_rx) = mpsc::channel(BODIES_TASK_BUFFER_SIZE);
         let (to_downloader, updates_rx) = mpsc::unbounded_channel();
@@ -80,21 +47,23 @@ impl TaskDownloader {
             downloader,
         };
 
-        spawner.spawn(downloader.boxed());
+        runtime.spawn_task(downloader);
 
         Self { from_downloader: ReceiverStream::new(bodies_rx), to_downloader }
     }
 }
 
-impl BodyDownloader for TaskDownloader {
+impl<B: Block + 'static> BodyDownloader for TaskDownloader<B> {
+    type Block = B;
+
     fn set_download_range(&mut self, range: RangeInclusive<BlockNumber>) -> DownloadResult<()> {
         let _ = self.to_downloader.send(range);
         Ok(())
     }
 }
 
-impl Stream for TaskDownloader {
-    type Item = BodyDownloaderResult;
+impl<B: Block + 'static> Stream for TaskDownloader<B> {
+    type Item = BodyDownloaderResult<B>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().from_downloader.poll_next(cx)
@@ -102,9 +71,9 @@ impl Stream for TaskDownloader {
 }
 
 /// A [`BodyDownloader`] that runs on its own task
-struct SpawnedDownloader<T> {
+struct SpawnedDownloader<T: BodyDownloader> {
     updates: UnboundedReceiverStream<RangeInclusive<BlockNumber>>,
-    bodies_tx: PollSender<BodyDownloaderResult>,
+    bodies_tx: PollSender<BodyDownloaderResult<T::Block>>,
     downloader: T,
 }
 
@@ -182,17 +151,19 @@ mod tests {
         let factory = create_test_provider_factory();
         let (headers, mut bodies) = generate_bodies(0..=19);
 
-        insert_headers(factory.db_ref().db(), &headers);
+        insert_headers(&factory, &headers);
 
         let client = Arc::new(
             TestBodiesClient::default().with_bodies(bodies.clone()).with_should_delay(true),
         );
-        let downloader = BodiesDownloaderBuilder::default().build(
-            client.clone(),
-            Arc::new(TestConsensus::default()),
-            factory,
-        );
-        let mut downloader = TaskDownloader::spawn(downloader);
+        let downloader = BodiesDownloaderBuilder::default()
+            .build::<reth_ethereum_primitives::Block, _, _>(
+                client.clone(),
+                Arc::new(TestConsensus::default()),
+                factory,
+            );
+        let runtime = Runtime::test();
+        let mut downloader = TaskDownloader::spawn_with(downloader, &runtime);
 
         downloader.set_download_range(0..=19).expect("failed to set download range");
 
@@ -204,17 +175,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::reversed_empty_ranges)]
+    #[expect(clippy::reversed_empty_ranges)]
     async fn set_download_range_error_returned() {
         reth_tracing::init_test_tracing();
         let factory = create_test_provider_factory();
 
-        let downloader = BodiesDownloaderBuilder::default().build(
-            Arc::new(TestBodiesClient::default()),
-            Arc::new(TestConsensus::default()),
-            factory,
-        );
-        let mut downloader = TaskDownloader::spawn(downloader);
+        let downloader = BodiesDownloaderBuilder::default()
+            .build::<reth_ethereum_primitives::Block, _, _>(
+                Arc::new(TestBodiesClient::default()),
+                Arc::new(TestConsensus::default()),
+                factory,
+            );
+        let runtime = Runtime::test();
+        let mut downloader = TaskDownloader::spawn_with(downloader, &runtime);
 
         downloader.set_download_range(1..=0).expect("failed to set download range");
         assert_matches!(downloader.next().await, Some(Err(DownloadError::InvalidBodyRange { .. })));

@@ -4,27 +4,31 @@ use crate::{
     table::{Compress, Decode, Decompress, Encode},
     DatabaseError,
 };
+use alloy_consensus::Header;
 use alloy_genesis::GenesisAccount;
 use alloy_primitives::{Address, Bytes, Log, B256, U256};
 use reth_codecs::{add_arbitrary_tests, Compact};
-use reth_primitives::{
-    Account, Bytecode, Header, Receipt, StorageEntry, TransactionSignedNoHash, TxType,
-};
+use reth_ethereum_primitives::{Receipt, TransactionSigned, TxType};
+use reth_primitives_traits::{Account, Bytecode, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneSegment};
 use reth_stages_types::StageCheckpoint;
-use reth_trie_common::{StoredNibbles, StoredNibblesSubKey, *};
+use reth_trie_common::{StorageTrieEntry, StoredNibbles, StoredNibblesSubKey, *};
 use serde::{Deserialize, Serialize};
 
 pub mod accounts;
 pub mod blocks;
 pub mod integer_list;
+pub mod metadata;
 pub mod sharded_key;
 pub mod storage_sharded_key;
 
 pub use accounts::*;
 pub use blocks::*;
+pub use integer_list::IntegerList;
+pub use metadata::*;
 pub use reth_db_models::{
-    AccountBeforeTx, ClientVersion, StoredBlockBodyIndices, StoredBlockWithdrawals,
+    AccountBeforeTx, ClientVersion, StaticFileBlockWithdrawals, StorageBeforeTx,
+    StoredBlockBodyIndices, StoredBlockWithdrawals,
 };
 pub use sharded_key::ShardedKey;
 
@@ -120,13 +124,10 @@ impl Decode for String {
 }
 
 impl Encode for StoredNibbles {
-    type Encoded = Vec<u8>;
+    type Encoded = arrayvec::ArrayVec<u8, 64>;
 
-    // Delegate to the Compact implementation
     fn encode(self) -> Self::Encoded {
-        // NOTE: This used to be `to_compact`, but all it does is append the bytes to the buffer,
-        // so we can just use the implementation of `Into<Vec<u8>>` to reuse the buffer.
-        self.0.into()
+        self.0.iter().collect()
     }
 }
 
@@ -137,17 +138,42 @@ impl Decode for StoredNibbles {
 }
 
 impl Encode for StoredNibblesSubKey {
-    type Encoded = Vec<u8>;
+    type Encoded = [u8; 65];
 
-    // Delegate to the Compact implementation
     fn encode(self) -> Self::Encoded {
-        let mut buf = Vec::with_capacity(65);
-        self.to_compact(&mut buf);
-        buf
+        self.to_compact_array()
     }
 }
 
 impl Decode for StoredNibblesSubKey {
+    fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+        Ok(Self::from_compact(value, value.len()).0)
+    }
+}
+
+impl Encode for PackedStoredNibbles {
+    type Encoded = [u8; 33];
+
+    fn encode(self) -> Self::Encoded {
+        self.to_compact_array()
+    }
+}
+
+impl Decode for PackedStoredNibbles {
+    fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
+        Ok(Self::from_compact(value, value.len()).0)
+    }
+}
+
+impl Encode for PackedStoredNibblesSubKey {
+    type Encoded = [u8; 33];
+
+    fn encode(self) -> Self::Encoded {
+        self.to_compact_array()
+    }
+}
+
+impl Decode for PackedStoredNibblesSubKey {
     fn decode(value: &[u8]) -> Result<Self, DatabaseError> {
         Ok(Self::from_compact(value, value.len()).0)
     }
@@ -188,18 +214,18 @@ impl Decode for ClientVersion {
 
 /// Implements compression for Compact type.
 macro_rules! impl_compression_for_compact {
-    ($($name:tt),+) => {
+    ($($name:ident$(<$($generic:ident),*>)?),+) => {
         $(
-            impl Compress for $name {
+            impl$(<$($generic: core::fmt::Debug + Send + Sync + Compact),*>)? Compress for $name$(<$($generic),*>)? {
                 type Compressed = Vec<u8>;
 
-                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
-                    let _ = Compact::to_compact(&self, buf);
+                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+                    let _ = Compact::to_compact(self, buf);
                 }
             }
 
-            impl Decompress for $name {
-                fn decompress(value: &[u8]) -> Result<$name, $crate::DatabaseError> {
+            impl$(<$($generic: core::fmt::Debug + Send + Sync + Compact),*>)? Decompress for $name$(<$($generic),*>)? {
+                fn decompress(value: &[u8]) -> Result<$name$(<$($generic),*>)?, $crate::DatabaseError> {
                     let (obj, _) = Compact::from_compact(value, value.len());
                     Ok(obj)
                 }
@@ -213,19 +239,24 @@ impl_compression_for_compact!(
     Header,
     Account,
     Log,
-    Receipt,
+    Receipt<T>,
     TxType,
     StorageEntry,
     BranchNodeCompact,
     StoredNibbles,
     StoredNibblesSubKey,
     StorageTrieEntry,
+    PackedStoredNibbles,
+    PackedStoredNibblesSubKey,
+    PackedStorageTrieEntry,
     StoredBlockBodyIndices,
-    StoredBlockOmmers,
+    StoredBlockOmmers<H>,
     StoredBlockWithdrawals,
+    StaticFileBlockWithdrawals,
     Bytecode,
     AccountBeforeTx,
-    TransactionSignedNoHash,
+    StorageBeforeTx,
+    TransactionSigned,
     CompactU256,
     StageCheckpoint,
     PruneCheckpoint,
@@ -233,6 +264,14 @@ impl_compression_for_compact!(
     // Non-DB
     GenesisAccount
 );
+
+#[cfg(feature = "op")]
+mod op {
+    use super::*;
+    use op_alloy_consensus::{OpReceipt, OpTxEnvelope};
+
+    impl_compression_for_compact!(OpTxEnvelope, OpReceipt);
+}
 
 macro_rules! impl_compression_fixed_compact {
     ($($name:tt),+) => {
@@ -244,8 +283,8 @@ macro_rules! impl_compression_fixed_compact {
                     Some(self.as_ref())
                 }
 
-                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(self, buf: &mut B) {
-                    let _  = Compact::to_compact(&self, buf);
+                fn compress_to_buf<B: bytes::BufMut + AsMut<[u8]>>(&self, buf: &mut B) {
+                    let _ = Compact::to_compact(self, buf);
                 }
             }
 
@@ -267,7 +306,7 @@ impl_compression_fixed_compact!(B256, Address);
 macro_rules! add_wrapper_struct {
     ($(($name:tt, $wrapper:tt)),+) => {
         $(
-            /// Wrapper struct so it can use StructFlags from Compact, when used as pure table values.
+            /// Wrapper struct so it can use `StructFlags` from Compact, when used as pure table values.
             #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, Compact)]
             #[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
             #[add_arbitrary_tests(compact)]
@@ -308,12 +347,11 @@ mod tests {
     //
     // this check is to ensure we do not inadvertently add too many fields to a struct which would
     // expand the flags field and break backwards compatibility
-    #[cfg(not(feature = "optimism"))]
     #[test]
     fn test_ensure_backwards_compatibility() {
         use super::*;
         use reth_codecs::{test_utils::UnusedBits, validate_bitflag_backwards_compat};
-        use reth_primitives::{Account, Receipt, ReceiptWithBloom, Withdrawals};
+        use reth_primitives_traits::Account;
         use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
         use reth_stages_types::{
             AccountHashingCheckpoint, CheckpointBlockRange, EntitiesCheckpoint,
@@ -333,15 +371,11 @@ mod tests {
         assert_eq!(PruneCheckpoint::bitflag_encoded_bytes(), 1);
         assert_eq!(PruneMode::bitflag_encoded_bytes(), 1);
         assert_eq!(PruneSegment::bitflag_encoded_bytes(), 1);
-        assert_eq!(Receipt::bitflag_encoded_bytes(), 1);
-        assert_eq!(ReceiptWithBloom::bitflag_encoded_bytes(), 0);
         assert_eq!(StageCheckpoint::bitflag_encoded_bytes(), 1);
         assert_eq!(StageUnitCheckpoint::bitflag_encoded_bytes(), 1);
         assert_eq!(StoredBlockBodyIndices::bitflag_encoded_bytes(), 1);
-        assert_eq!(StoredBlockOmmers::bitflag_encoded_bytes(), 0);
         assert_eq!(StoredBlockWithdrawals::bitflag_encoded_bytes(), 0);
         assert_eq!(StorageHashingCheckpoint::bitflag_encoded_bytes(), 1);
-        assert_eq!(Withdrawals::bitflag_encoded_bytes(), 0);
 
         validate_bitflag_backwards_compat!(Account, UnusedBits::NotZero);
         validate_bitflag_backwards_compat!(AccountHashingCheckpoint, UnusedBits::NotZero);
@@ -356,14 +390,10 @@ mod tests {
         validate_bitflag_backwards_compat!(PruneCheckpoint, UnusedBits::NotZero);
         validate_bitflag_backwards_compat!(PruneMode, UnusedBits::Zero);
         validate_bitflag_backwards_compat!(PruneSegment, UnusedBits::Zero);
-        validate_bitflag_backwards_compat!(Receipt, UnusedBits::Zero);
-        validate_bitflag_backwards_compat!(ReceiptWithBloom, UnusedBits::Zero);
         validate_bitflag_backwards_compat!(StageCheckpoint, UnusedBits::NotZero);
         validate_bitflag_backwards_compat!(StageUnitCheckpoint, UnusedBits::Zero);
         validate_bitflag_backwards_compat!(StoredBlockBodyIndices, UnusedBits::Zero);
-        validate_bitflag_backwards_compat!(StoredBlockOmmers, UnusedBits::Zero);
         validate_bitflag_backwards_compat!(StoredBlockWithdrawals, UnusedBits::Zero);
         validate_bitflag_backwards_compat!(StorageHashingCheckpoint, UnusedBits::NotZero);
-        validate_bitflag_backwards_compat!(Withdrawals, UnusedBits::Zero);
     }
 }

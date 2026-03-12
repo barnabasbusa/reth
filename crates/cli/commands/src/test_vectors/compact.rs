@@ -1,4 +1,5 @@
-use alloy_primitives::{hex, private::getrandom::getrandom, TxKind};
+use alloy_eips::eip4895::Withdrawals;
+use alloy_primitives::{hex, Signature, TxKind, B256};
 use arbitrary::Arbitrary;
 use eyre::{Context, Result};
 use proptest::{
@@ -16,14 +17,15 @@ use reth_codecs::alloy::{
     withdrawal::Withdrawal,
 };
 use reth_db::{
-    models::{AccountBeforeTx, StoredBlockBodyIndices, StoredBlockOmmers, StoredBlockWithdrawals},
+    models::{
+        AccountBeforeTx, StaticFileBlockWithdrawals, StoredBlockBodyIndices, StoredBlockOmmers,
+        StoredBlockWithdrawals,
+    },
     ClientVersion,
 };
+use reth_ethereum_primitives::{Receipt, Transaction, TransactionSigned, TxType};
 use reth_fs_util as fs;
-use reth_primitives::{
-    Account, Log, LogData, Receipt, ReceiptWithBloom, StorageEntry, Transaction,
-    TransactionSignedNoHash, TxType, Withdrawals,
-};
+use reth_primitives_traits::{Account, Log, LogData, StorageEntry};
 use reth_prune_types::{PruneCheckpoint, PruneMode};
 use reth_stages_types::{
     AccountHashingCheckpoint, CheckpointBlockRange, EntitiesCheckpoint, ExecutionCheckpoint,
@@ -61,7 +63,7 @@ macro_rules! compact_types {
         pub static IDENTIFIER_TYPE: std::sync::LazyLock<std::collections::HashSet<String>> = std::sync::LazyLock::new(|| {
             let mut map = std::collections::HashSet::new();
             $(
-                map.insert(type_name::<$id_ty>());
+                 map.insert(type_name::<$id_ty>());
             )*
             map
         });
@@ -75,14 +77,13 @@ compact_types!(
         // reth-primitives
         Account,
         Receipt,
-        Withdrawals,
-        ReceiptWithBloom,
         // reth_codecs::alloy
         Authorization,
         GenesisAccount,
         Header,
         HeaderExt,
         Withdrawal,
+        Withdrawals,
         TxEip2930,
         TxEip1559,
         TxEip4844,
@@ -93,7 +94,6 @@ compact_types!(
         Log,
         // BranchNodeCompact, // todo requires arbitrary
         TrieMask,
-        // TxDeposit, TODO(joshie): optimism
         // reth_prune_types
         PruneCheckpoint,
         PruneMode,
@@ -111,8 +111,9 @@ compact_types!(
         StoredBlockOmmers,
         StoredBlockBodyIndices,
         StoredBlockWithdrawals,
+        StaticFileBlockWithdrawals,
         // Manual implementations
-        TransactionSignedNoHash,
+        TransactionSigned,
         // Bytecode, // todo revm arbitrary
         StorageEntry,
         // MerkleCheckpoint, // todo storedsubnode -> branchnodecompact arbitrary
@@ -126,7 +127,7 @@ compact_types!(
     ],
     // These types require an extra identifier which is usually stored elsewhere (eg. parent type).
     identifier: [
-        // Signature todo we for v we only store parity(true || false), while v can take more values
+        Signature,
         Transaction,
         TxType,
         TxKind
@@ -143,20 +144,19 @@ pub fn read_vectors() -> Result<()> {
 }
 
 /// Generates a vector of type `T` to a file.
-pub fn generate_vectors_with(gen: &[fn(&mut TestRunner) -> eyre::Result<()>]) -> Result<()> {
+pub fn generate_vectors_with(generator: &[fn(&mut TestRunner) -> eyre::Result<()>]) -> Result<()> {
     // Prepare random seed for test (same method as used by proptest)
-    let mut seed = [0u8; 32];
-    getrandom(&mut seed)?;
+    let seed = B256::random();
     println!("Seed for compact test vectors: {:?}", hex::encode_prefixed(seed));
 
     // Start the runner with the seed
     let config = ProptestConfig::default();
-    let rng = TestRng::from_seed(config.rng_algorithm, &seed);
+    let rng = TestRng::from_seed(config.rng_algorithm, &seed.0);
     let mut runner = TestRunner::new_with_rng(config, rng);
 
     fs::create_dir_all(VECTORS_FOLDER)?;
 
-    for generate_fn in gen {
+    for generate_fn in generator {
         generate_fn(&mut runner)?;
     }
 
@@ -167,9 +167,22 @@ pub fn generate_vectors_with(gen: &[fn(&mut TestRunner) -> eyre::Result<()>]) ->
 /// re-encoding.
 pub fn read_vectors_with(read: &[fn() -> eyre::Result<()>]) -> Result<()> {
     fs::create_dir_all(VECTORS_FOLDER)?;
+    let mut errors = None;
 
     for read_fn in read {
-        read_fn()?;
+        if let Err(err) = read_fn() {
+            errors.get_or_insert_with(Vec::new).push(err);
+        }
+    }
+
+    if let Some(err_list) = errors {
+        for error in err_list {
+            eprintln!("{error:?}");
+        }
+        return Err(eyre::eyre!(
+            "If there are missing types, make sure to run `reth test-vectors compact --write` first.\n
+             If it happened during CI, ignore IF it's a new proposed type that `main` branch does not have."
+        ));
     }
 
     Ok(())
@@ -183,7 +196,7 @@ where
     let type_name = type_name::<T>();
     print!("{}", &type_name);
 
-    let mut bytes = std::iter::repeat(0u8).take(256).collect::<Vec<u8>>();
+    let mut bytes = std::iter::repeat_n(0u8, 256).collect::<Vec<u8>>();
     let mut compact_buffer = vec![];
 
     let mut values = Vec::with_capacity(VECTOR_SIZE);
@@ -199,7 +212,7 @@ where
                 Err(err) => {
                     if tries < 5 && matches!(err, arbitrary::Error::NotEnoughData) {
                         tries += 1;
-                        bytes.extend(std::iter::repeat(0u8).take(256));
+                        bytes.extend(std::iter::repeat_n(0u8, 256));
                     } else {
                         return Err(err)?
                     }
@@ -238,9 +251,8 @@ where
 
     // Read the file where the vectors are stored
     let file_path = format!("{VECTORS_FOLDER}/{}.json", &type_name);
-    let file = File::open(&file_path).wrap_err_with(|| {
-        "Failed to open vector. Make sure to run `reth test-vectors compact --write` first."
-    })?;
+    let file =
+        File::open(&file_path).wrap_err_with(|| format!("Failed to open vector {type_name}."))?;
     let reader = BufReader::new(file);
 
     let stored_values: Vec<String> = serde_json::from_reader(reader)?;
@@ -258,7 +270,7 @@ where
 
         let (reconstructed, _) = T::from_compact(&compact_bytes, len_or_identifier);
         reconstructed.to_compact(&mut buffer);
-        assert_eq!(buffer, compact_bytes);
+        assert_eq!(buffer, compact_bytes, "mismatch {type_name}");
     }
 
     println!(" ✅");
@@ -266,6 +278,15 @@ where
     Ok(())
 }
 
+/// Returns the type name for the given type.
 pub fn type_name<T>() -> String {
-    std::any::type_name::<T>().split("::").last().unwrap_or(std::any::type_name::<T>()).to_string()
+    // With alloy type transition <https://github.com/paradigmxyz/reth/pull/15768> the types are renamed, we map them here to the original name so that test vector files remain consistent
+    let name = std::any::type_name::<T>();
+    match name {
+        "alloy_consensus::transaction::envelope::EthereumTypedTransaction<alloy_consensus::transaction::eip4844::TxEip4844>" => "Transaction".to_string(),
+        "alloy_consensus::transaction::envelope::EthereumTxEnvelope<alloy_consensus::transaction::eip4844::TxEip4844>" => "TransactionSigned".to_string(),
+        name => {
+            name.split("::").last().unwrap_or(std::any::type_name::<T>()).to_string()
+        }
+    }
 }

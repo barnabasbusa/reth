@@ -1,13 +1,15 @@
-use futures::{FutureExt, Stream};
+use alloy_primitives::Sealable;
+use futures::Stream;
 use futures_util::StreamExt;
 use pin_project::pin_project;
 use reth_network_p2p::headers::{
     downloader::{HeaderDownloader, SyncTarget},
     error::HeadersDownloaderResult,
 };
-use reth_primitives::SealedHeader;
-use reth_tasks::{TaskSpawner, TokioTaskExecutor};
+use reth_primitives_traits::SealedHeader;
+use reth_tasks::Runtime;
 use std::{
+    fmt::Debug,
     future::Future,
     pin::Pin,
     task::{ready, Context, Poll},
@@ -22,50 +24,20 @@ pub const HEADERS_TASK_BUFFER_SIZE: usize = 8;
 /// A [HeaderDownloader] that drives a spawned [HeaderDownloader] on a spawned task.
 #[derive(Debug)]
 #[pin_project]
-pub struct TaskDownloader {
+pub struct TaskDownloader<H: Sealable> {
     #[pin]
-    from_downloader: ReceiverStream<HeadersDownloaderResult<Vec<SealedHeader>>>,
-    to_downloader: UnboundedSender<DownloaderUpdates>,
+    from_downloader: ReceiverStream<HeadersDownloaderResult<Vec<SealedHeader<H>>, H>>,
+    to_downloader: UnboundedSender<DownloaderUpdates<H>>,
 }
 
 // === impl TaskDownloader ===
 
-impl TaskDownloader {
-    /// Spawns the given `downloader` via [`tokio::task::spawn`] and returns a [`TaskDownloader`]
+impl<H: Sealable + Send + Sync + Unpin + 'static> TaskDownloader<H> {
+    /// Spawns the given `downloader` via the given [`Runtime`] and returns a [`TaskDownloader`]
     /// that's connected to that task.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if called outside of a Tokio runtime
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use reth_downloaders::headers::reverse_headers::ReverseHeadersDownloader;
-    /// # use reth_downloaders::headers::task::TaskDownloader;
-    /// # use reth_consensus::Consensus;
-    /// # use reth_network_p2p::headers::client::HeadersClient;
-    /// # fn t<H: HeadersClient + 'static>(consensus:Arc<dyn Consensus>, client: Arc<H>) {
-    ///    let downloader = ReverseHeadersDownloader::<H>::builder().build(
-    ///        client,
-    ///        consensus
-    ///     );
-    ///   let downloader = TaskDownloader::spawn(downloader);
-    /// # }
-    pub fn spawn<T>(downloader: T) -> Self
+    pub fn spawn_with<T>(downloader: T, runtime: &Runtime) -> Self
     where
-        T: HeaderDownloader + 'static,
-    {
-        Self::spawn_with(downloader, &TokioTaskExecutor::default())
-    }
-
-    /// Spawns the given `downloader` via the given [`TaskSpawner`] returns a [`TaskDownloader`]
-    /// that's connected to that task.
-    pub fn spawn_with<T, S>(downloader: T, spawner: &S) -> Self
-    where
-        T: HeaderDownloader + 'static,
-        S: TaskSpawner,
+        T: HeaderDownloader<Header = H> + 'static,
     {
         let (headers_tx, headers_rx) = mpsc::channel(HEADERS_TASK_BUFFER_SIZE);
         let (to_downloader, updates_rx) = mpsc::unbounded_channel();
@@ -75,18 +47,20 @@ impl TaskDownloader {
             updates: UnboundedReceiverStream::new(updates_rx),
             downloader,
         };
-        spawner.spawn(downloader.boxed());
+        runtime.spawn_task(downloader);
 
         Self { from_downloader: ReceiverStream::new(headers_rx), to_downloader }
     }
 }
 
-impl HeaderDownloader for TaskDownloader {
-    fn update_sync_gap(&mut self, head: SealedHeader, target: SyncTarget) {
+impl<H: Sealable + Debug + Send + Sync + Unpin + 'static> HeaderDownloader for TaskDownloader<H> {
+    type Header = H;
+
+    fn update_sync_gap(&mut self, head: SealedHeader<H>, target: SyncTarget) {
         let _ = self.to_downloader.send(DownloaderUpdates::UpdateSyncGap(head, target));
     }
 
-    fn update_local_head(&mut self, head: SealedHeader) {
+    fn update_local_head(&mut self, head: SealedHeader<H>) {
         let _ = self.to_downloader.send(DownloaderUpdates::UpdateLocalHead(head));
     }
 
@@ -99,8 +73,8 @@ impl HeaderDownloader for TaskDownloader {
     }
 }
 
-impl Stream for TaskDownloader {
-    type Item = HeadersDownloaderResult<Vec<SealedHeader>>;
+impl<H: Sealable> Stream for TaskDownloader<H> {
+    type Item = HeadersDownloaderResult<Vec<SealedHeader<H>>, H>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.project().from_downloader.poll_next(cx)
@@ -108,9 +82,10 @@ impl Stream for TaskDownloader {
 }
 
 /// A [`HeaderDownloader`] that runs on its own task
-struct SpawnedDownloader<T> {
-    updates: UnboundedReceiverStream<DownloaderUpdates>,
-    headers_tx: PollSender<HeadersDownloaderResult<Vec<SealedHeader>>>,
+#[expect(clippy::complexity)]
+struct SpawnedDownloader<T: HeaderDownloader> {
+    updates: UnboundedReceiverStream<DownloaderUpdates<T::Header>>,
+    headers_tx: PollSender<HeadersDownloaderResult<Vec<SealedHeader<T::Header>>, T::Header>>,
     downloader: T,
 }
 
@@ -169,10 +144,11 @@ impl<T: HeaderDownloader> Future for SpawnedDownloader<T> {
     }
 }
 
-/// Commands delegated tot the spawned [`HeaderDownloader`]
-enum DownloaderUpdates {
-    UpdateSyncGap(SealedHeader, SyncTarget),
-    UpdateLocalHead(SealedHeader),
+/// Commands delegated to the spawned [`HeaderDownloader`]
+#[derive(Debug)]
+enum DownloaderUpdates<H> {
+    UpdateSyncGap(SealedHeader<H>, SyncTarget),
+    UpdateLocalHead(SealedHeader<H>),
     UpdateSyncTarget(SyncTarget),
     SetBatchSize(usize),
 }
@@ -202,7 +178,8 @@ mod tests {
             .request_limit(1)
             .build(Arc::clone(&client), Arc::new(TestConsensus::default()));
 
-        let mut downloader = TaskDownloader::spawn(downloader);
+        let runtime = Runtime::test();
+        let mut downloader = TaskDownloader::spawn_with(downloader, &runtime);
         downloader.update_local_head(p3.clone());
         downloader.update_sync_target(SyncTarget::Tip(p0.hash()));
 
@@ -216,11 +193,11 @@ mod tests {
             .await;
 
         let headers = downloader.next().await.unwrap();
-        assert_eq!(headers, Ok(vec![p0]));
+        assert_eq!(headers.unwrap(), vec![p0]);
 
         let headers = downloader.next().await.unwrap();
-        assert_eq!(headers, Ok(vec![p1]));
+        assert_eq!(headers.unwrap(), vec![p1]);
         let headers = downloader.next().await.unwrap();
-        assert_eq!(headers, Ok(vec![p2]));
+        assert_eq!(headers.unwrap(), vec![p2]);
     }
 }

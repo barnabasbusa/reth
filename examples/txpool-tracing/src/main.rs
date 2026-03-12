@@ -2,27 +2,30 @@
 //!
 //! Run with
 //!
-//! ```not_rust
+//! ```sh
 //! cargo run --release -p txpool-tracing -- node --http --ws --recipients 0x....,0x....
 //! ```
 //!
 //! If no recipients are specified, all transactions will be traced.
 
-#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![warn(unused_crate_dependencies)]
 
 use alloy_primitives::Address;
 use alloy_rpc_types_trace::{parity::TraceType, tracerequest::TraceCallRequest};
 use clap::Parser;
 use futures_util::StreamExt;
-use reth::{
-    builder::NodeHandle, chainspec::EthereumChainSpecParser, cli::Cli,
-    rpc::compat::transaction::transaction_to_call_request, transaction_pool::TransactionPool,
+use reth_ethereum::{
+    cli::{chainspec::EthereumChainSpecParser, interface::Cli},
+    node::{builder::NodeHandle, EthereumNode},
+    pool::TransactionPool,
+    rpc::eth::primitives::TransactionRequest,
 };
-use reth_node_ethereum::node::EthereumNode;
+
+mod submit;
 
 fn main() {
     Cli::<EthereumChainSpecParser, RethCliTxpoolExt>::parse()
-        .run(|builder, args| async move {
+        .run(async move |builder, args| {
             // launch the node
             let NodeHandle { node, node_exit_future } =
                 builder.node(EthereumNode::default()).launch().await?;
@@ -35,27 +38,27 @@ fn main() {
 
             println!("Spawning trace task!");
             // Spawn an async block to listen for transactions.
-            node.task_executor.spawn(Box::pin(async move {
+            node.task_executor.spawn_task(async move {
                 // Waiting for new transactions
                 while let Some(event) = pending_transactions.next().await {
                     let tx = event.transaction;
                     println!("Transaction received: {tx:?}");
 
-                    if let Some(recipient) = tx.to() {
-                        if args.is_match(&recipient) {
-                            // trace the transaction with `trace_call`
-                            let callrequest =
-                                transaction_to_call_request(tx.to_recovered_transaction());
-                            let tracerequest = TraceCallRequest::new(callrequest)
-                                .with_trace_type(TraceType::Trace);
-                            if let Ok(trace_result) = traceapi.trace_call(tracerequest).await {
-                                let hash = tx.hash();
-                                println!("trace result for transaction {hash}: {trace_result:?}");
-                            }
+                    if let Some(recipient) = tx.to() &&
+                        args.is_match(&recipient)
+                    {
+                        // trace the transaction with `trace_call`
+                        let callrequest =
+                            TransactionRequest::from_recovered_transaction(tx.to_consensus());
+                        let tracerequest =
+                            TraceCallRequest::new(callrequest).with_trace_type(TraceType::Trace);
+                        if let Ok(trace_result) = traceapi.trace_call(tracerequest).await {
+                            let hash = tx.hash();
+                            println!("trace result for transaction {hash}: {trace_result:?}");
                         }
                     }
                 }
-            }));
+            });
 
             node_exit_future.await
         })
@@ -65,7 +68,7 @@ fn main() {
 /// Our custom cli args extension that adds one flag to reth default CLI.
 #[derive(Debug, Clone, Default, clap::Args)]
 struct RethCliTxpoolExt {
-    /// recipients addresses that we want to trace
+    /// recipients' addresses that we want to trace
     #[arg(long, value_delimiter = ',')]
     pub recipients: Vec<Address>,
 }

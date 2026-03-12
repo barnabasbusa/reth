@@ -44,7 +44,8 @@ impl<'a> StructHandler<'a> {
 
     /// Generates `to_compact` code for a struct field.
     fn to(&mut self, field_descriptor: &StructFieldDescriptor) {
-        let (name, ftype, is_compact, use_alt_impl) = field_descriptor;
+        let StructFieldDescriptor { name, ftype, is_compact, use_alt_impl, is_reference: _ } =
+            field_descriptor;
 
         let to_compact_ident = if *use_alt_impl {
             format_ident!("specialized_to_compact")
@@ -97,7 +98,7 @@ impl<'a> StructHandler<'a> {
 
     /// Generates `from_compact` code for a struct field.
     fn from(&mut self, field_descriptor: &StructFieldDescriptor, known_types: &[&str]) {
-        let (name, ftype, is_compact, use_alt_impl) = field_descriptor;
+        let StructFieldDescriptor { name, ftype, is_compact, use_alt_impl, .. } = field_descriptor;
 
         let (name, len) = if name.is_empty() {
             self.is_wrapper = true;
@@ -139,26 +140,22 @@ impl<'a> StructHandler<'a> {
 
         if ftype == "Bytes" {
             self.lines.push(quote! {
-                let mut #name = Bytes::new();
-                (#name, buf) = Bytes::from_compact(buf, buf.len() as usize);
+                let (#name, buf) = Bytes::from_compact(buf, buf.len() as usize);
             })
         } else {
             let ident_type = format_ident!("{ftype}");
             if !is_flag_type(ftype) {
                 // It's a type that handles its own length requirements. (B256, Custom, ...)
                 self.lines.push(quote! {
-                    let (#name, new_buf) = #ident_type::#from_compact_ident(buf, buf.len());
+                    let (#name, buf) = #ident_type::#from_compact_ident(buf, buf.len());
                 })
             } else if *is_compact {
                 self.lines.push(quote! {
-                    let (#name, new_buf) = #ident_type::#from_compact_ident(buf, flags.#len() as usize);
+                    let (#name, buf) = #ident_type::#from_compact_ident(buf, flags.#len() as usize);
                 });
             } else {
-                todo!()
+                unreachable!("flag-type fields are always compact in Compact derive")
             }
-            self.lines.push(quote! {
-                buf = new_buf;
-            });
         }
     }
 }

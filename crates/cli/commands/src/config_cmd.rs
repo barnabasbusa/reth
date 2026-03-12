@@ -1,11 +1,9 @@
 //! CLI command to show configs.
 
-use std::path::PathBuf;
-
 use clap::Parser;
 use eyre::{bail, WrapErr};
 use reth_config::Config;
-
+use std::path::PathBuf;
 /// `reth config` command
 #[derive(Debug, Parser)]
 pub struct Command {
@@ -24,13 +22,14 @@ impl Command {
         let config = if self.default {
             Config::default()
         } else {
-            let path = self.config.clone().unwrap_or_default();
-            // Check if the file exists
+            let path = match self.config.as_ref() {
+                Some(path) => path,
+                None => bail!("No config file provided. Use --config <FILE> or pass --default"),
+            };
             if !path.exists() {
                 bail!("Config file does not exist: {}", path.display());
             }
-            // Read the configuration file
-            Config::from_path(&path)
+            Config::from_path(path)
                 .wrap_err_with(|| format!("Could not load config file: {}", path.display()))?
         };
         println!("{}", toml::to_string_pretty(&config)?);

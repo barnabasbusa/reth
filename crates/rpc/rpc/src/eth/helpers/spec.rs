@@ -1,25 +1,16 @@
 use alloy_primitives::U256;
-use reth_chainspec::EthereumHardforks;
-use reth_network_api::NetworkInfo;
-use reth_provider::{BlockNumReader, ChainSpecProvider, StageCheckpointReader};
+use reth_rpc_convert::RpcConvert;
 use reth_rpc_eth_api::{helpers::EthApiSpec, RpcNodeCore};
+use reth_rpc_eth_types::EthApiError;
 
 use crate::EthApi;
 
-impl<Provider, Pool, Network, EvmConfig> EthApiSpec for EthApi<Provider, Pool, Network, EvmConfig>
+impl<N, Rpc> EthApiSpec for EthApi<N, Rpc>
 where
-    Self: RpcNodeCore<
-        Provider: ChainSpecProvider<ChainSpec: EthereumHardforks>
-                      + BlockNumReader
-                      + StageCheckpointReader,
-        Network: NetworkInfo,
-    >,
+    N: RpcNodeCore,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
     fn starting_block(&self) -> U256 {
         self.inner.starting_block()
-    }
-
-    fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn reth_rpc_eth_api::helpers::EthSigner>>> {
-        self.inner.signers()
     }
 }

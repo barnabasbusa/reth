@@ -1,10 +1,62 @@
 //! All capability related types
 
-use crate::EthVersion;
+use crate::{EthMessageID, EthVersion};
+use alloc::{borrow::Cow, string::String, vec::Vec};
+use alloy_primitives::bytes::Bytes;
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use bytes::BufMut;
+use core::fmt;
 use reth_codecs_derive::add_arbitrary_tests;
-use std::{borrow::Cow, fmt};
+
+/// A Capability message consisting of the message-id and the payload.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RawCapabilityMessage {
+    /// Identifier of the message.
+    pub id: usize,
+    /// Actual __encoded__ payload
+    pub payload: Bytes,
+}
+
+impl RawCapabilityMessage {
+    /// Creates a new capability message with the given id and payload.
+    pub const fn new(id: usize, payload: Bytes) -> Self {
+        Self { id, payload }
+    }
+
+    /// Creates a raw message for the eth sub-protocol.
+    ///
+    /// Caller must ensure that the rlp encoded `payload` matches the given `id`.
+    ///
+    /// See also  [`EthMessage`](crate::EthMessage)
+    pub const fn eth(id: EthMessageID, payload: Bytes) -> Self {
+        Self::new(id.to_u8() as usize, payload)
+    }
+}
+
+impl Encodable for RawCapabilityMessage {
+    /// Encodes the `RawCapabilityMessage` into an RLP byte stream.
+    fn encode(&self, out: &mut dyn BufMut) {
+        self.id.encode(out);
+        out.put_slice(&self.payload);
+    }
+
+    /// Returns the total length of the encoded message.
+    fn length(&self) -> usize {
+        self.id.length() + self.payload.len()
+    }
+}
+
+impl Decodable for RawCapabilityMessage {
+    /// Decodes a `RawCapabilityMessage` from an RLP byte stream.
+    fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
+        let id = usize::decode(buf)?;
+        let payload = Bytes::copy_from_slice(buf);
+        *buf = &buf[buf.len()..];
+
+        Ok(Self { id, payload })
+    }
+}
 
 /// A message indicating a supported capability and capability version.
 #[add_arbitrary_tests(rlp)]
@@ -48,6 +100,21 @@ impl Capability {
         Self::eth(EthVersion::Eth68)
     }
 
+    /// Returns the [`EthVersion::Eth69`] capability.
+    pub const fn eth_69() -> Self {
+        Self::eth(EthVersion::Eth69)
+    }
+
+    /// Returns the [`EthVersion::Eth70`] capability.
+    pub const fn eth_70() -> Self {
+        Self::eth(EthVersion::Eth70)
+    }
+
+    /// Returns the [`EthVersion::Eth71`] capability.
+    pub const fn eth_71() -> Self {
+        Self::eth(EthVersion::Eth71)
+    }
+
     /// Whether this is eth v66 protocol.
     #[inline]
     pub fn is_eth_v66(&self) -> bool {
@@ -66,10 +133,33 @@ impl Capability {
         self.name == "eth" && self.version == 68
     }
 
+    /// Whether this is eth v69.
+    #[inline]
+    pub fn is_eth_v69(&self) -> bool {
+        self.name == "eth" && self.version == 69
+    }
+
+    /// Whether this is eth v70.
+    #[inline]
+    pub fn is_eth_v70(&self) -> bool {
+        self.name == "eth" && self.version == 70
+    }
+
+    /// Whether this is eth v71.
+    #[inline]
+    pub fn is_eth_v71(&self) -> bool {
+        self.name == "eth" && self.version == 71
+    }
+
     /// Whether this is any eth version.
     #[inline]
     pub fn is_eth(&self) -> bool {
-        self.is_eth_v66() || self.is_eth_v67() || self.is_eth_v68()
+        self.is_eth_v66() ||
+            self.is_eth_v67() ||
+            self.is_eth_v68() ||
+            self.is_eth_v69() ||
+            self.is_eth_v70() ||
+            self.is_eth_v71()
     }
 }
 
@@ -89,9 +179,9 @@ impl From<EthVersion> for Capability {
 #[cfg(any(test, feature = "arbitrary"))]
 impl<'a> arbitrary::Arbitrary<'a> for Capability {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let version = u.int_in_range(0..=32)?; // TODO: What's the max?
-        let name = String::arbitrary(u)?; // TODO: what possible values?
-        Ok(Self::new(name, version))
+        let version = u.int_in_range(66..=71)?; // Valid eth protocol versions are 66-71
+                                                // Only generate valid eth protocol name for now since it's the only supported protocol
+        Ok(Self::new_static("eth", version))
     }
 }
 
@@ -103,9 +193,24 @@ pub struct Capabilities {
     eth_66: bool,
     eth_67: bool,
     eth_68: bool,
+    eth_69: bool,
+    eth_70: bool,
+    eth_71: bool,
 }
 
 impl Capabilities {
+    /// Create a new instance from the given vec.
+    pub fn new(value: Vec<Capability>) -> Self {
+        Self {
+            eth_66: value.iter().any(Capability::is_eth_v66),
+            eth_67: value.iter().any(Capability::is_eth_v67),
+            eth_68: value.iter().any(Capability::is_eth_v68),
+            eth_69: value.iter().any(Capability::is_eth_v69),
+            eth_70: value.iter().any(Capability::is_eth_v70),
+            eth_71: value.iter().any(Capability::is_eth_v71),
+            inner: value,
+        }
+    }
     /// Returns all capabilities.
     #[inline]
     pub fn capabilities(&self) -> &[Capability] {
@@ -121,7 +226,7 @@ impl Capabilities {
     /// Whether the peer supports `eth` sub-protocol.
     #[inline]
     pub const fn supports_eth(&self) -> bool {
-        self.eth_68 || self.eth_67 || self.eth_66
+        self.eth_71 || self.eth_70 || self.eth_69 || self.eth_68 || self.eth_67 || self.eth_66
     }
 
     /// Whether this peer supports eth v66 protocol.
@@ -141,16 +246,29 @@ impl Capabilities {
     pub const fn supports_eth_v68(&self) -> bool {
         self.eth_68
     }
+
+    /// Whether this peer supports eth v69 protocol.
+    #[inline]
+    pub const fn supports_eth_v69(&self) -> bool {
+        self.eth_69
+    }
+
+    /// Whether this peer supports eth v70 protocol.
+    #[inline]
+    pub const fn supports_eth_v70(&self) -> bool {
+        self.eth_70
+    }
+
+    /// Whether this peer supports eth v71 protocol.
+    #[inline]
+    pub const fn supports_eth_v71(&self) -> bool {
+        self.eth_71
+    }
 }
 
 impl From<Vec<Capability>> for Capabilities {
     fn from(value: Vec<Capability>) -> Self {
-        Self {
-            eth_66: value.iter().any(Capability::is_eth_v66),
-            eth_67: value.iter().any(Capability::is_eth_v67),
-            eth_68: value.iter().any(Capability::is_eth_v68),
-            inner: value,
-        }
+        Self::new(value)
     }
 }
 
@@ -168,6 +286,9 @@ impl Decodable for Capabilities {
             eth_66: inner.iter().any(Capability::is_eth_v66),
             eth_67: inner.iter().any(Capability::is_eth_v67),
             eth_68: inner.iter().any(Capability::is_eth_v68),
+            eth_69: inner.iter().any(Capability::is_eth_v69),
+            eth_70: inner.iter().any(Capability::is_eth_v70),
+            eth_71: inner.iter().any(Capability::is_eth_v71),
             inner,
         })
     }

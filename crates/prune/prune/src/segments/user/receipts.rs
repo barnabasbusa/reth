@@ -2,10 +2,11 @@ use crate::{
     segments::{PruneInput, Segment},
     PrunerError,
 };
-use reth_db::transaction::DbTxMut;
+use reth_db_api::{table::Value, transaction::DbTxMut};
+use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
-    errors::provider::ProviderResult, BlockReader, DBProvider, PruneCheckpointWriter,
-    TransactionsProvider,
+    errors::provider::ProviderResult, BlockReader, DBProvider, NodePrimitivesProvider,
+    PruneCheckpointWriter, StaticFileProviderFactory, StorageSettingsCache, TransactionsProvider,
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment, SegmentOutput};
 use tracing::instrument;
@@ -23,7 +24,13 @@ impl Receipts {
 
 impl<Provider> Segment<Provider> for Receipts
 where
-    Provider: DBProvider<Tx: DbTxMut> + PruneCheckpointWriter + TransactionsProvider + BlockReader,
+    Provider: DBProvider<Tx: DbTxMut>
+        + PruneCheckpointWriter
+        + TransactionsProvider
+        + BlockReader
+        + StorageSettingsCache
+        + StaticFileProviderFactory
+        + NodePrimitivesProvider<Primitives: NodePrimitives<Receipt: Value>>,
 {
     fn segment(&self) -> PruneSegment {
         PruneSegment::Receipts
@@ -37,7 +44,12 @@ where
         PrunePurpose::User
     }
 
-    #[instrument(level = "trace", target = "pruner", skip(self, provider), ret)]
+    #[instrument(
+        name = "Receipts::prune",
+        target = "pruner",
+        skip(self, provider),
+        ret(level = "trace")
+    )]
     fn prune(&self, provider: &Provider, input: PruneInput) -> Result<SegmentOutput, PrunerError> {
         crate::segments::receipts::prune(provider, input)
     }

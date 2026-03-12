@@ -30,7 +30,7 @@ pub struct BodyDownloaderMetrics {
     pub buffered_responses: Gauge,
     /// The number of blocks the internal buffer of the
     /// downloader.
-    /// These are bodies that have been received, but not cannot be committed yet because they're
+    /// These are bodies that have been received, but cannot be committed yet because they're
     /// not contiguous
     pub buffered_blocks: Gauge,
     /// Total amount of memory used by the buffered blocks in bytes
@@ -59,6 +59,15 @@ impl BodyDownloaderMetrics {
             DownloadError::BodyValidation { .. } => self.validation_errors.increment(1),
             _error => self.unexpected_errors.increment(1),
         }
+    }
+
+    /// Clear all gauge metrics by setting them to 0.
+    pub fn clear(&self) {
+        self.in_flight_requests.set(0);
+        self.buffered_responses.set(0);
+        self.buffered_blocks.set(0);
+        self.buffered_blocks_size_bytes.set(0);
+        self.queued_blocks.set(0);
     }
 }
 
@@ -101,7 +110,7 @@ pub struct HeaderDownloaderMetrics {
     pub buffered_responses: Gauge,
     /// The number of blocks the internal buffer of the
     /// downloader.
-    /// These are bodies that have been received, but not cannot be committed yet because they're
+    /// These are bodies that have been received, but cannot be committed yet because they're
     /// not contiguous
     pub buffered_blocks: Gauge,
     /// Total amount of memory used by the buffered blocks in bytes

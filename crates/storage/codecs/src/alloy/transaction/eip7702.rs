@@ -16,12 +16,13 @@ use reth_codecs_derive::add_arbitrary_tests;
 ///
 /// Notice: Make sure this struct is 1:1 with [`alloy_consensus::TxEip7702`]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Compact)]
+#[reth_codecs(crate = "crate")]
 #[cfg_attr(
     any(test, feature = "test-utils"),
     derive(arbitrary::Arbitrary, serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(feature = "test-utils", allow(unreachable_pub), visibility::make(pub))]
-#[add_arbitrary_tests(compact)]
+#[add_arbitrary_tests(crate, compact)]
 pub(crate) struct TxEip7702 {
     chain_id: ChainId,
     nonce: u64,
@@ -56,7 +57,8 @@ impl Compact for AlloyTxEip7702 {
     }
 
     fn from_compact(buf: &[u8], len: usize) -> (Self, &[u8]) {
-        let (tx, _) = TxEip7702::from_compact(buf, len);
+        // Return the remaining slice from the inner from_compact to advance the cursor correctly.
+        let (tx, remaining) = TxEip7702::from_compact(buf, len);
         let alloy_tx = Self {
             chain_id: tx.chain_id,
             nonce: tx.nonce,
@@ -69,6 +71,6 @@ impl Compact for AlloyTxEip7702 {
             access_list: tx.access_list,
             authorization_list: tx.authorization_list,
         };
-        (alloy_tx, buf)
+        (alloy_tx, remaining)
     }
 }

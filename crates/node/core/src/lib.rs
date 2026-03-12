@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod args;
 pub mod cli;
@@ -15,20 +15,22 @@ pub mod exit;
 pub mod node_config;
 pub mod utils;
 pub mod version;
-/// Re-exported from `reth_primitives`.
+
+/// Re-exported primitive types
 pub mod primitives {
-    pub use reth_primitives::*;
+    pub use reth_ethereum_forks::*;
+    pub use reth_primitives_traits::*;
 }
 
 /// Re-export of `reth_rpc_*` crates.
 pub mod rpc {
-    /// Re-exported from `reth_rpc::rpc`.
+    /// Re-exported from `reth_rpc_server_types::result`.
     pub mod result {
         pub use reth_rpc_server_types::result::*;
     }
 
-    /// Re-exported from `reth_rpc::eth`.
+    /// Re-exported from `reth_rpc_convert`.
     pub mod compat {
-        pub use reth_rpc_types_compat::*;
+        pub use reth_rpc_convert::*;
     }
 }

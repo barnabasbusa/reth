@@ -1,7 +1,8 @@
 use futures_util::StreamExt;
-use reth::api::{BuiltPayload, PayloadBuilderAttributes};
+use reth_node_api::{BlockBody, PayloadKind};
 use reth_payload_builder::{PayloadBuilderHandle, PayloadId};
-use reth_payload_primitives::{Events, PayloadBuilder, PayloadTypes};
+use reth_payload_builder_primitives::Events;
+use reth_payload_primitives::{BuiltPayload, PayloadBuilderAttributes, PayloadTypes};
 use tokio_stream::wrappers::BroadcastStream;
 
 /// Helper for payload operations
@@ -11,14 +12,14 @@ pub struct PayloadTestContext<T: PayloadTypes> {
     payload_builder: PayloadBuilderHandle<T>,
     pub timestamp: u64,
     #[debug(skip)]
-    attributes_generator: Box<dyn Fn(u64) -> T::PayloadBuilderAttributes>,
+    attributes_generator: Box<dyn Fn(u64) -> T::PayloadBuilderAttributes + Send + Sync>,
 }
 
 impl<T: PayloadTypes> PayloadTestContext<T> {
     /// Creates a new payload helper
     pub async fn new(
         payload_builder: PayloadBuilderHandle<T>,
-        attributes_generator: impl Fn(u64) -> T::PayloadBuilderAttributes + 'static,
+        attributes_generator: impl Fn(u64) -> T::PayloadBuilderAttributes + Send + Sync + 'static,
     ) -> eyre::Result<Self> {
         let payload_events = payload_builder.subscribe().await?;
         let payload_event_stream = payload_events.into_stream();
@@ -53,15 +54,30 @@ impl<T: PayloadTypes> PayloadTestContext<T> {
         Ok(())
     }
 
-    /// Wait until the best built payload is ready
+    /// Wait until the best built payload is ready.
+    ///
+    /// Panics if the payload builder does not produce a non-empty payload within 30 seconds.
     pub async fn wait_for_built_payload(&self, payload_id: PayloadId) {
+        let start = std::time::Instant::now();
         loop {
-            let payload = self.payload_builder.best_payload(payload_id).await.unwrap().unwrap();
-            if payload.block().body.transactions.is_empty() {
+            let payload =
+                self.payload_builder.best_payload(payload_id).await.transpose().ok().flatten();
+            if payload.is_none_or(|p| p.block().body().transactions().is_empty()) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "timed out waiting for a non-empty payload for {payload_id} — \
+                     check that the chain spec supports all generated tx types"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 continue
             }
-            break
+            // Resolve payload once its built
+            self.payload_builder
+                .resolve_kind(payload_id, PayloadKind::Earliest)
+                .await
+                .unwrap()
+                .unwrap();
+            break;
         }
     }
 

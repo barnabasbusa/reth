@@ -1,7 +1,9 @@
 //! API for block submission validation.
 
 use alloy_rpc_types_beacon::relay::{
-    BuilderBlockValidationRequest, BuilderBlockValidationRequestV2, BuilderBlockValidationRequestV3,
+    BuilderBlockValidationRequest, BuilderBlockValidationRequestV2,
+    BuilderBlockValidationRequestV3, BuilderBlockValidationRequestV4,
+    BuilderBlockValidationRequestV5,
 };
 use jsonrpsee::proc_macros::rpc;
 
@@ -28,5 +30,19 @@ pub trait BlockSubmissionValidationApi {
     async fn validate_builder_submission_v3(
         &self,
         request: BuilderBlockValidationRequestV3,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV4")]
+    async fn validate_builder_submission_v4(
+        &self,
+        request: BuilderBlockValidationRequestV4,
+    ) -> jsonrpsee::core::RpcResult<()>;
+
+    /// A Request to validate a block submission.
+    #[method(name = "validateBuilderSubmissionV5")]
+    async fn validate_builder_submission_v5(
+        &self,
+        request: BuilderBlockValidationRequestV5,
     ) -> jsonrpsee::core::RpcResult<()>;
 }

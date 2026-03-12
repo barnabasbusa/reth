@@ -1,7 +1,5 @@
 //! Ethereum protocol-related constants
 
-use alloy_primitives::{address, b256, Address, B256};
-
 /// Gas units, for example [`GIGAGAS`].
 pub mod gas_units;
 pub use gas_units::{GIGAGAS, KILOGAS, MEGAGAS};
@@ -12,15 +10,15 @@ pub const RETH_CLIENT_VERSION: &str = concat!("reth/v", env!("CARGO_PKG_VERSION"
 /// Minimum gas limit allowed for transactions.
 pub const MINIMUM_GAS_LIMIT: u64 = 5000;
 
-/// Holesky genesis hash: `0xb5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4`
-pub const HOLESKY_GENESIS_HASH: B256 =
-    b256!("b5f7f912443c940f21fd611f12828d75b534364ed9e95ca4e307729a4661bde4");
+/// Maximum gas limit allowed for block.
+/// In hex this number is `0x7fffffffffffffff`
+pub const MAXIMUM_GAS_LIMIT_BLOCK: u64 = 2u64.pow(63) - 1;
 
-/// From address from Optimism system txs: `0xdeaddeaddeaddeaddeaddeaddeaddeaddead0001`
-pub const OP_SYSTEM_TX_FROM_ADDR: Address = address!("deaddeaddeaddeaddeaddeaddeaddeaddead0001");
+/// The bound divisor of the gas limit, used in update calculations.
+pub const GAS_LIMIT_BOUND_DIVISOR: u64 = 1024;
 
-/// To address from Optimism system txs: `0x4200000000000000000000000000000000000015`
-pub const OP_SYSTEM_TX_TO_ADDR: Address = address!("4200000000000000000000000000000000000015");
+/// Maximum transaction gas limit as defined by [EIP-7825](https://eips.ethereum.org/EIPS/eip-7825) activated in `Osaka` hardfork.
+pub const MAX_TX_GAS_LIMIT_OSAKA: u64 = 2u64.pow(24);
 
 /// The number of blocks to unwind during a reorg that already became a part of canonical chain.
 ///

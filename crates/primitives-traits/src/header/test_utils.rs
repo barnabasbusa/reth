@@ -1,9 +1,12 @@
-//! Test utilities to generate random valid headers.
+//! Test utilities for the block header.
 
-use crate::Header;
+use alloy_consensus::Header;
 use alloy_primitives::B256;
 use proptest::{arbitrary::any, prop_compose};
 use proptest_arbitrary_interop::arb;
+
+/// Re-export `HeaderMut` for backward compatibility in tests.
+pub use super::HeaderMut as TestHeader;
 
 /// Generates a header which is valid __with respect to past and future forks__. This means, for
 /// example, that if the withdrawals root is present, the base fee per gas is also present.

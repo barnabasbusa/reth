@@ -1,33 +1,31 @@
 //! Support for building a pending block with transactions from local view of mempool.
 
-use reth_chainspec::{EthChainSpec, EthereumHardforks};
-use reth_evm::ConfigureEvm;
-use reth_primitives::Header;
-use reth_provider::{BlockReaderIdExt, ChainSpecProvider, EvmEnvProvider, StateProviderFactory};
-use reth_rpc_eth_api::{
-    helpers::{LoadPendingBlock, SpawnBlocking},
-    RpcNodeCore,
-};
-use reth_rpc_eth_types::PendingBlock;
-use reth_transaction_pool::TransactionPool;
-
 use crate::EthApi;
+use reth_rpc_convert::RpcConvert;
+use reth_rpc_eth_api::{
+    helpers::{pending_block::PendingEnvBuilder, LoadPendingBlock},
+    FromEvmError, RpcNodeCore,
+};
+use reth_rpc_eth_types::{builder::config::PendingBlockKind, EthApiError, PendingBlock};
 
-impl<Provider, Pool, Network, EvmConfig> LoadPendingBlock
-    for EthApi<Provider, Pool, Network, EvmConfig>
+impl<N, Rpc> LoadPendingBlock for EthApi<N, Rpc>
 where
-    Self: SpawnBlocking
-        + RpcNodeCore<
-            Provider: BlockReaderIdExt
-                          + EvmEnvProvider
-                          + ChainSpecProvider<ChainSpec: EthChainSpec + EthereumHardforks>
-                          + StateProviderFactory,
-            Pool: TransactionPool,
-            Evm: ConfigureEvm<Header = Header>,
-        >,
+    N: RpcNodeCore,
+    EthApiError: FromEvmError<N::Evm>,
+    Rpc: RpcConvert<Primitives = N::Primitives, Error = EthApiError>,
 {
     #[inline]
-    fn pending_block(&self) -> &tokio::sync::Mutex<Option<PendingBlock>> {
+    fn pending_block(&self) -> &tokio::sync::Mutex<Option<PendingBlock<Self::Primitives>>> {
         self.inner.pending_block()
+    }
+
+    #[inline]
+    fn pending_env_builder(&self) -> &dyn PendingEnvBuilder<Self::Evm> {
+        self.inner.pending_env_builder()
+    }
+
+    #[inline]
+    fn pending_block_kind(&self) -> PendingBlockKind {
+        self.inner.pending_block_kind()
     }
 }

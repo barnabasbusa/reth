@@ -1,25 +1,107 @@
 mod receipts;
 mod set;
-mod static_file;
 mod user;
 
-use crate::PrunerError;
+use crate::{PruneLimiter, PrunerError};
 use alloy_primitives::{BlockNumber, TxNumber};
-use reth_provider::{errors::provider::ProviderResult, BlockReader, PruneCheckpointWriter};
+use reth_provider::{
+    errors::provider::ProviderResult, BlockReader, PruneCheckpointWriter, StaticFileProviderFactory,
+};
 use reth_prune_types::{
-    PruneCheckpoint, PruneLimiter, PruneMode, PrunePurpose, PruneSegment, SegmentOutput,
+    PruneCheckpoint, PruneMode, PruneProgress, PrunePurpose, PruneSegment, SegmentOutput,
+    SegmentOutputCheckpoint,
 };
+use reth_stages_types::StageId;
+use reth_static_file_types::StaticFileSegment;
 pub use set::SegmentSet;
-pub use static_file::{
-    Headers as StaticFileHeaders, Receipts as StaticFileReceipts,
-    Transactions as StaticFileTransactions,
-};
 use std::{fmt::Debug, ops::RangeInclusive};
 use tracing::error;
 pub use user::{
-    AccountHistory, Receipts as UserReceipts, ReceiptsByLogs, SenderRecovery, StorageHistory,
-    TransactionLookup,
+    AccountHistory, Bodies, Receipts as UserReceipts, ReceiptsByLogs, SenderRecovery,
+    StorageHistory, TransactionLookup,
 };
+
+/// Prunes data from static files for a given segment.
+///
+/// This is a generic helper function used by both receipts and bodies pruning
+/// when data is stored in static files.
+///
+/// The checkpoint block number is set to the highest block in the actually deleted files,
+/// not `input.to_block`, since `to_block` might refer to a block in the middle of an
+/// undeleted file.
+pub(crate) fn prune_static_files<Provider>(
+    provider: &Provider,
+    input: PruneInput,
+    segment: StaticFileSegment,
+) -> Result<SegmentOutput, PrunerError>
+where
+    Provider: StaticFileProviderFactory,
+{
+    let deleted_headers =
+        provider.static_file_provider().delete_segment_below_block(segment, input.to_block + 1)?;
+
+    if deleted_headers.is_empty() {
+        return Ok(SegmentOutput {
+            progress: PruneProgress::Finished,
+            pruned: 0,
+            checkpoint: input
+                .previous_checkpoint
+                .map(SegmentOutputCheckpoint::from_prune_checkpoint),
+        })
+    }
+
+    let tx_ranges = deleted_headers.iter().filter_map(|header| header.tx_range());
+
+    let pruned = tx_ranges.clone().map(|range| range.len()).sum::<u64>() as usize;
+
+    // The highest block number in the deleted files is the actual checkpoint.
+    let checkpoint_block = deleted_headers
+        .iter()
+        .filter_map(|header| header.block_range())
+        .map(|range| range.end())
+        .max();
+
+    Ok(SegmentOutput {
+        progress: PruneProgress::Finished,
+        pruned,
+        checkpoint: Some(SegmentOutputCheckpoint {
+            block_number: checkpoint_block,
+            tx_number: tx_ranges.map(|range| range.end()).max(),
+        }),
+    })
+}
+
+/// Deletes ALL static file jars for a given segment.
+///
+/// This is used for `PruneMode::Full` where all data should be removed, including the highest jar.
+/// Unlike [`prune_static_files`], this does not preserve the most recent jar.
+pub(crate) fn delete_static_files_segment<Provider>(
+    provider: &Provider,
+    input: PruneInput,
+    segment: StaticFileSegment,
+) -> Result<SegmentOutput, PrunerError>
+where
+    Provider: StaticFileProviderFactory,
+{
+    let deleted_headers = provider.static_file_provider().delete_segment(segment)?;
+
+    if deleted_headers.is_empty() {
+        return Ok(SegmentOutput::done())
+    }
+
+    let tx_ranges = deleted_headers.iter().filter_map(|header| header.tx_range());
+
+    let pruned = tx_ranges.clone().map(|range| range.len()).sum::<u64>() as usize;
+
+    Ok(SegmentOutput {
+        progress: PruneProgress::Finished,
+        pruned,
+        checkpoint: Some(SegmentOutputCheckpoint {
+            block_number: Some(input.to_block),
+            tx_number: tx_ranges.map(|range| range.end()).max(),
+        }),
+    })
+}
 
 /// A segment represents a pruning of some portion of the data.
 ///
@@ -51,6 +133,14 @@ pub trait Segment<Provider>: Debug + Send + Sync {
         Provider: PruneCheckpointWriter,
     {
         provider.save_prune_checkpoint(self.segment(), checkpoint)
+    }
+
+    /// Returns the stage this segment depends on, if any.
+    ///
+    /// If this returns `Some(stage_id)`, the pruner will skip this segment if the stage
+    /// has not yet caught up with the `Finish` stage checkpoint.
+    fn required_stage(&self) -> Option<StageId> {
+        None
     }
 }
 
@@ -95,7 +185,7 @@ impl PruneInput {
                 let last_tx = body.last_tx_num();
                 if last_tx + body.tx_count() == 0 {
                     // Prevents a scenario where the pruner correctly starts at a finalized block,
-                    // but the first transaction (tx_num = 0) only appears on an non-finalized one.
+                    // but the first transaction (tx_num = 0) only appears on a non-finalized one.
                     // Should only happen on a test/hive scenario.
                     return Ok(None)
                 }
@@ -149,8 +239,9 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use reth_provider::{
-        providers::BlockchainProvider2,
+        providers::BlockchainProvider,
         test_utils::{create_test_provider_factory, MockEthProvider},
+        BlockWriter,
     };
     use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
 
@@ -192,15 +283,15 @@ mod tests {
         let provider_rw = factory.provider_rw().expect("failed to get provider_rw");
         for block in &blocks {
             provider_rw
-                .insert_historical_block(
-                    block.clone().seal_with_senders().expect("failed to seal block with senders"),
+                .insert_block(
+                    &block.clone().try_recover().expect("failed to seal block with senders"),
                 )
                 .expect("failed to insert block");
         }
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider2::new(factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
 
         // Since there are no transactions, expected None
         let range = input.get_next_tx_num_range(&provider).expect("Expected range");
@@ -230,22 +321,21 @@ mod tests {
         let provider_rw = factory.provider_rw().expect("failed to get provider_rw");
         for block in &blocks {
             provider_rw
-                .insert_historical_block(
-                    block.clone().seal_with_senders().expect("failed to seal block with senders"),
+                .insert_block(
+                    &block.clone().try_recover().expect("failed to seal block with senders"),
                 )
                 .expect("failed to insert block");
         }
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider2::new(factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
 
         // Get the next tx number range
         let range = input.get_next_tx_num_range(&provider).expect("Expected range").unwrap();
 
         // Calculate the total number of transactions
-        let num_txs =
-            blocks.iter().map(|block| block.body.transactions().count() as u64).sum::<u64>();
+        let num_txs = blocks.iter().map(|block| block.transaction_count() as u64).sum::<u64>();
 
         assert_eq!(range, 0..=num_txs - 1);
     }
@@ -277,22 +367,21 @@ mod tests {
         let provider_rw = factory.provider_rw().expect("failed to get provider_rw");
         for block in &blocks {
             provider_rw
-                .insert_historical_block(
-                    block.clone().seal_with_senders().expect("failed to seal block with senders"),
+                .insert_block(
+                    &block.clone().try_recover().expect("failed to seal block with senders"),
                 )
                 .expect("failed to insert block");
         }
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider2::new(factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
 
         // Fetch the range and check if it is correct
         let range = input.get_next_tx_num_range(&provider).expect("Expected range").unwrap();
 
         // Calculate the total number of transactions
-        let num_txs =
-            blocks.iter().map(|block| block.body.transactions().count() as u64).sum::<u64>();
+        let num_txs = blocks.iter().map(|block| block.transaction_count() as u64).sum::<u64>();
 
         assert_eq!(range, 0..=num_txs - 1,);
     }
@@ -314,20 +403,19 @@ mod tests {
         let provider_rw = factory.provider_rw().expect("failed to get provider_rw");
         for block in &blocks {
             provider_rw
-                .insert_historical_block(
-                    block.clone().seal_with_senders().expect("failed to seal block with senders"),
+                .insert_block(
+                    &block.clone().try_recover().expect("failed to seal block with senders"),
                 )
                 .expect("failed to insert block");
         }
         provider_rw.commit().expect("failed to commit");
 
         // Create a new provider
-        let provider = BlockchainProvider2::new(factory).unwrap();
+        let provider = BlockchainProvider::new(factory).unwrap();
 
         // Get the last tx number
         // Calculate the total number of transactions
-        let num_txs =
-            blocks.iter().map(|block| block.body.transactions().count() as u64).sum::<u64>();
+        let num_txs = blocks.iter().map(|block| block.transaction_count() as u64).sum::<u64>();
         let max_range = num_txs - 1;
 
         // Create a prune input with a previous checkpoint that is the last tx number

@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /// Traits, validation methods, and helper types used to abstract over engine types.
 pub use reth_engine_primitives as engine;
@@ -16,8 +16,12 @@ pub use reth_engine_primitives::*;
 pub use reth_payload_primitives as payload;
 pub use reth_payload_primitives::*;
 
+/// Traits and helper types used to abstract over payload builder types.
+pub use reth_payload_builder_primitives as payload_builder;
+pub use reth_payload_builder_primitives::*;
+
 /// Traits and helper types used to abstract over EVM methods and types.
-pub use reth_evm::{ConfigureEvm, ConfigureEvmEnv, NextBlockEnvAttributes};
+pub use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 
 pub mod node;
 pub use node::*;
